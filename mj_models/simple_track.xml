@@ -1,0 +1,36 @@
+<mujoco model="simple_car_track">
+    <compiler angle="radian" coordinate="local" inertiafromgeom="true"/>
+    <option timestep="0.02" gravity="0 0 -9.81"/>
+    
+    <worldbody>
+        <!-- Ground plane -->
+        <geom name="ground" type="plane" size="10 10 0.1" pos="0 0 0" rgba="0.9 0.9 0.9 1"/>
+        
+        <!-- Simple oval track boundaries (outer and inner walls as boxes) -->
+        <!-- Outer walls -->
+        <geom name="outer_left" type="box" pos="-3 0 0.5" size="0.2 4 0.5" rgba="0.5 0.5 0.5 1"/>
+        <geom name="outer_right" type="box" pos="3 0 0.5" size="0.2 4 0.5" rgba="0.5 0.5 0.5 1"/>
+        <geom name="outer_top" type="box" pos="0 4 0.5" size="3.2 0.2 0.5" rgba="0.5 0.5 0.5 1"/>
+        <geom name="outer_bottom" type="box" pos="0 -4 0.5" size="3.2 0.2 0.5" rgba="0.5 0.5 0.5 1"/>
+        
+        <!-- Inner walls (smaller oval) -->
+        <geom name="inner_left" type="box" pos="-2 0 0.5" size="0.2 2 0.5" rgba="0.5 0.5 0.5 1"/>
+        <geom name="inner_right" type="box" pos="2 0 0.5" size="0.2 2 0.5" rgba="0.5 0.5 0.5 1"/>
+        <geom name="inner_top" type="box" pos="0 2 0.5" size="2.2 0.2 0.5" rgba="0.5 0.5 0.5 1"/>
+        <geom name="inner_bottom" type="box" pos="0 -2 0.5" size="2.2 0.2 0.5" rgba="0.5 0.5 0.5 1"/>
+        
+        <!-- Car body -->
+        <body name="car" pos="0 -3 0.2">
+            <joint type="free" name="car_joint"/>
+            <geom name="car_body" type="box" size="0.3 0.5 0.2" rgba="1 0 0 1"/>
+            <!-- Actuators will be applied via code -->
+        </body>
+        
+        <!-- Following camera -->
+        <camera name="follow_cam" mode="track" target="car" pos="0 -5 2" fovy="60"/>
+    </worldbody>
+    
+    <actuator>
+        <!-- No actuators in XML; applied programmatically -->
+    </actuator>
+</mujoco>
