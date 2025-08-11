@@ -9,12 +9,13 @@ import re
 
 def main():
     env = SimpleCarEnv(render_mode='rgb_array')
-    # Find latest model
-    model_files = sorted(glob.glob("models/ppo_car_*.zip"))
-    if not model_files:
-        raise ValueError("No models found in models/")
-    latest_model = model_files[-1]
-    model_num = int(re.search(r'ppo_car_(\d+)\.zip', latest_model).group(1))
+    # Find latest run folder
+    run_dirs = sorted(glob.glob("runs/run_*"), key=lambda x: int(re.search(r'run_(\d+)', x).group(1)))
+    if not run_dirs:
+        raise ValueError("No run folders found in runs/")
+    latest_run = run_dirs[-1]
+    run_num = int(re.search(r'run_(\d+)', latest_run).group(1))
+    latest_model = f"{latest_run}/ppo_car.zip"
     model = PPO.load(latest_model)
     
     obs, _ = env.reset()
@@ -31,13 +32,12 @@ def main():
         if done:
             print(f"Completed {info['laps']} laps")
     
-    # Save video with numbering
-    os.makedirs('videos', exist_ok=True)
+    # Save video in run folder with sub-numbering
     sub_num = 1
-    video_path = f'videos/eval_{model_num}.mp4'
+    video_path = f'{latest_run}/eval_{sub_num}.mp4'
     while os.path.exists(video_path):
         sub_num += 1
-        video_path = f'videos/eval_{model_num}_{sub_num}.mp4'
+        video_path = f'{latest_run}/eval_{sub_num}.mp4'
     imageio.mimsave(video_path, frames, fps=30)
     print(f"Video saved to {video_path}")
     

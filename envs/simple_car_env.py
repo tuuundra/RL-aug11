@@ -20,8 +20,9 @@ class SimpleCarEnv(gym.Env):
         self.action_space = spaces.Box(low=np.array([-1.0, -1.0]), high=np.array([1.0, 1.0]), dtype=np.float32)
         
         # Observation: [pos_x, pos_y, pos_z, vel_x, vel_y, vel_z, angle, 5_lidars]
-        low = np.array([-10]*3 + [-5]*3 + [-np.pi] + [0]*5)
-        high = np.array([10]*3 + [5]*3 + [np.pi] + [20]*5)
+        # Normalize positions to ~[-1,1] for track ~ +/- 50m
+        low = np.array([-2]*3 + [-20]*3 + [-np.pi] + [0]*5)
+        high = np.array([2]*3 + [20]*3 + [np.pi] + [100]*5)
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
         
         self.render_mode = render_mode
@@ -29,32 +30,39 @@ class SimpleCarEnv(gym.Env):
         self.total_laps = total_laps
         self.current_lap = 0
         self.prev_angle = 0.0
+        self.cum_angle = 0.0
         self.steps = 0
-        self.max_steps = 2000
+        self.max_steps = 5000
         
         # Track parameters (oval center at 0,0)
-        self.track_center = np.array([0,0])
-        self.track_a = 3.0  # semi-major x
-        self.track_b = 4.0  # semi-minor y
+        self.track_a = 30.0  # semi-major x
+        self.track_b = 40.0  # semi-minor y
+        
+        # Force scales
+        self.drive_scale = 1500.0
+        self.steer_scale = 300.0
+        self.last_steer = 0.0
         
     def step(self, action):
-        drive, steer = action
+        drive, steer = np.clip(action, -1.0, 1.0)
         car_body_id = self.model.body('car').id
         
         # Apply simple forces
-        forward_force = drive * 5.0  # scale force
-        yaw_torque = steer * 2.0     # scale torque
+        forward_force = drive * self.drive_scale
+        yaw_torque = steer * self.steer_scale
         
         # Apply force in car's forward direction
         quat = np.array(self.data.qpos[3:7]).reshape(4, 1)
-        mat = np.zeros(9).reshape(3, 3)
-        mujoco.mju_quat2Mat(mat.flatten(), quat.flatten())
-        forward = mat[:, 0]  # first column is forward vector
+        # Build rotation matrix from quaternion (row-major)
+        mat = np.zeros((3, 3))
+        mujoco.mju_quat2Mat(mat.ravel(), quat.ravel())
+        forward = mat[:, 0]
         force = forward * forward_force
         self.data.xfrc_applied[car_body_id, :3] = force
         
-        # Apply yaw torque
-        self.data.xfrc_applied[car_body_id, 5] = yaw_torque  # z-axis torque
+        # Apply yaw torque around z
+        self.data.xfrc_applied[car_body_id, 5] = yaw_torque
+        self.last_steer = steer
         
         mujoco.mj_step(self.model, self.data)
         self.steps += 1
@@ -65,71 +73,110 @@ class SimpleCarEnv(gym.Env):
         # Reward
         reward = self._get_reward()
         
-        # Done check
+        # Termination checks
         done = self.current_lap >= self.total_laps or self.steps >= self.max_steps
         truncated = False
         info = {'laps': self.current_lap}
         
-        # Simple collision detection (height check for off-track)
-        if self.data.qpos[2] < 0.1:  # fallen off
-            reward -= 50
+        # Off-track penalty / termination
+        pos_xy = self.data.qpos[0:2]
+        dist_norm = np.sqrt((pos_xy[0]/self.track_a)**2 + (pos_xy[1]/self.track_b)**2)
+        dist_to_center = abs(dist_norm - 1.0)
+        if dist_norm > 1.2 or self.data.qpos[2] < 0.1:
+            reward -= 50.0
             done = True
+        
+        # Clear applied forces for next step
+        self.data.xfrc_applied[car_body_id, :] = 0.0
         
         return obs, reward, done, truncated, info
     
     def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
         mujoco.mj_resetData(self.model, self.data)
-        # Start position
-        self.data.qpos[0] = 0
-        self.data.qpos[1] = -3
-        self.data.qpos[2] = 0.2
+        # Start position near bottom of oval with slight random yaw
+        self.data.qpos[0] = 0.0
+        self.data.qpos[1] = -35.0
+        self.data.qpos[2] = 0.5
+        yaw = self.np_random.uniform(-0.2, 0.2)
+        # Set quaternion from yaw-only (z-rotation)
+        cy = math.cos(yaw * 0.5)
+        sy = math.sin(yaw * 0.5)
+        self.data.qpos[3:7] = np.array([cy, 0.0, 0.0, sy])
         mujoco.mj_forward(self.model, self.data)
         
         self.current_lap = 0
-        self.prev_angle = 0.0
+        self.prev_angle = math.atan2(self.data.qpos[1], self.data.qpos[0])
+        self.cum_angle = 0.0
         self.steps = 0
         return self._get_obs(), {}
     
     def _get_obs(self):
-        pos = self.data.qpos[0:3]
+        pos = self.data.qpos[0:3] / np.array([50.0, 50.0, 5.0])  # normalize
         vel = self.data.qvel[0:3]
         # Simple yaw angle from quaternion (clamp to avoid nan)
         q = self.data.qpos[3:7]
-        qw = np.clip(q[0], -1.0, 1.0)  # clamp for arccos
-        angle = 2 * np.arccos(qw) * np.sign(q[3])  # approximate yaw
+        qw = np.clip(q[0], -1.0, 1.0)
+        angle = 2 * np.arccos(qw) * np.sign(q[3])
         
         # Lidar rays (5 rays)
         lidars = []
         ray_angles = np.deg2rad([-60, -30, 0, 30, 60])
-        pnt = np.array(pos).reshape(3, 1)  # shape (3,1)
-        geomid = np.array([-1], dtype=np.int32).reshape(1, 1)  # writable (1,1)
+        pnt = np.array(self.data.qpos[0:3]).reshape(3, 1)
+        geomid = np.array([-1], dtype=np.int32).reshape(1, 1)
         for da in ray_angles:
-            dir_vec = np.array([np.cos(angle + da), np.sin(angle + da), 0]).reshape(3, 1)
+            dir_vec = np.array([np.cos(angle + da), np.sin(angle + da), 0.0]).reshape(3, 1)
             dist = mujoco.mj_ray(self.model, self.data, pnt, dir_vec, None, 1, -1, geomid)
-            lidars.append(min(dist, 20.0) if dist >= 0 else 20.0)
+            # Cap and normalize distance roughly to [0,100]
+            lidars.append(min(dist, 100.0) if dist >= 0 else 100.0)
         
-        return np.concatenate([pos, vel, [angle], lidars])
+        return np.concatenate([pos, vel, [angle], lidars]).astype(np.float32)
     
     def _get_reward(self):
-        pos = self.data.qpos[0:2]
-        vel = np.linalg.norm(self.data.qvel[0:2])
+        # Position and centre distance
+        pos_xy = self.data.qpos[0:2]
+        dist_norm = np.sqrt((pos_xy[0]/self.track_a)**2 + (pos_xy[1]/self.track_b)**2)
+        dist_to_center = abs(dist_norm - 1.0)
+
+        # Forward progress incentive (dot product of velocity with track tangent)
+        vel_vec = self.data.cvel[1, 0:2].copy()  # car body (id=1) linear x,y
+        # Track tangent at current position (for an ellipse x^2/a^2 + y^2/b^2 =1)
+        if np.linalg.norm(vel_vec) > 1e-6:
+            tangent = np.array([-pos_xy[1] / (self.track_b ** 2), pos_xy[0] / (self.track_a ** 2)])
+            tangent /= (np.linalg.norm(tangent) + 1e-8)
+            forward_speed = np.dot(vel_vec, tangent)
+        else:
+            forward_speed = 0.0
+        reward = forward_speed  # 1.0 multiplier
         
-        # Progress: distance to center line
-        dist_to_center = np.abs(np.sqrt((pos[0]/self.track_a)**2 + (pos[1]/self.track_b)**2) - 1)
-        progress_reward = vel * (1 - dist_to_center)
+        # Centerline penalty (quadratic)
+        reward += -10.0 * (dist_to_center ** 2)
         
-        # Lap detection
-        current_angle = np.arctan2(pos[1], pos[0])
-        if current_angle - self.prev_angle > np.pi:
-            self.current_lap += 1
-            progress_reward += 100  # lap bonus
+        # Steering effort penalty (encourage smooth driving)
+        reward += -0.01 * (self.last_steer ** 2)
+        
+        # Lap bonus handled below
+
+        # Lap detection via cumulative angle
+        current_angle = math.atan2(pos_xy[1], pos_xy[0])
+        delta = current_angle - self.prev_angle
+        # unwrap
+        if delta > math.pi:
+            delta -= 2 * math.pi
+        elif delta < -math.pi:
+            delta += 2 * math.pi
+        self.cum_angle += delta
         self.prev_angle = current_angle
         
-        # Off-track penalty
-        if dist_to_center > 0.5:
-            progress_reward -= 10
+        # Count full rotations
+        while self.cum_angle >= 2 * math.pi:
+            self.cum_angle -= 2 * math.pi
+            self.current_lap += 1
+            reward += 100.0
         
-        return progress_reward + 0.1  # small alive bonus
+        # Small alive bonus to stabilize learning
+        reward += 0.01
+        return float(reward)
     
     def render(self):
         if self.render_mode == 'human':

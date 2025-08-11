@@ -16,13 +16,18 @@ def debug_car_journey(model_path: str = None, max_steps: int = 2000):
     
     # Load latest model if not specified
     if model_path is None:
-        model_files = sorted(glob.glob("models/ppo_car_*.zip"))
-        if not model_files:
-            raise ValueError("No models found in models/")
-        model_path = model_files[-1]
+        run_dirs = sorted(glob.glob("runs/run_*"), key=lambda x: int(re.search(r'run_(\d+)', x).group(1)))
+        if not run_dirs:
+            raise ValueError("No run folders found in runs/")
+        latest_run = run_dirs[-1]
+        run_num = int(re.search(r'run_(\d+)', latest_run).group(1))
+        model_path = f"{latest_run}/ppo_car.zip"
+    else:
+        # Extract run_num from provided path if possible
+        match = re.search(r'run_(\d+)/ppo_car\.zip', model_path)
+        run_num = int(match.group(1)) if match else 0
     
-    model_num = int(re.search(r'ppo_car_(\d+)\.zip', model_path).group(1))
-    print(f"Debugging model: {model_path} (number {model_num})")
+    print(f"Debugging model: {model_path} (run {run_num})")
     
     # Load model and environment
     env = SimpleCarEnv(render_mode=None)
@@ -123,8 +128,13 @@ def debug_car_journey(model_path: str = None, max_steps: int = 2000):
     ax4.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    os.makedirs('debug', exist_ok=True)
-    png_path = f'debug/car_journey_debug_{model_num}.png'
+    # Save PNG in run folder with sub-numbering
+    latest_run = os.path.dirname(model_path)
+    sub_num = 1
+    png_path = f'{latest_run}/car_journey_debug_{sub_num}.png'
+    while os.path.exists(png_path):
+        sub_num += 1
+        png_path = f'{latest_run}/car_journey_debug_{sub_num}.png'
     plt.savefig(png_path, dpi=150, bbox_inches='tight')
     print(f"Visualization saved as '{png_path}'")
     
