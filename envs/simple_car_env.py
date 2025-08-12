@@ -61,9 +61,12 @@ class SimpleCarEnv(gym.Env):
         return ((x / a) ** 2 + (y / b) ** 2)
     
     def _is_on_track(self, x, y):
-        eq = self._ellipse_eq(x, y, self.track_a, self.track_b)
-        dist_to_center = abs(eq - 1.0)
-        return dist_to_center <= (self.track_width / 2.0) / min(self.track_a, self.track_b)  # Approximate width check
+        min_dist = float('inf')
+        for wx, wy in self.waypoints:
+            dist = math.sqrt((x - wx)**2 + (y - wy)**2)
+            if dist < min_dist:
+                min_dist = dist
+        return min_dist <= self.track_width / 2.0
     
     def _dist_to_centerline(self):
         min_dist = float('inf')
@@ -275,7 +278,7 @@ class SimpleCarEnv(gym.Env):
             self.viewer.sync()
         elif self.render_mode == 'rgb_array':
             renderer = mujoco.Renderer(self.model)
-            renderer.update_scene(self.data, camera='follow_cam')
+            renderer.update_scene(self.data, camera='birds_eye')
             return renderer.render()
     
     def close(self):

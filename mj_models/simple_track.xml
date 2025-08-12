@@ -27,7 +27,7 @@
         </body>
         
         <!-- Following camera -->
-        <camera name="follow_cam" mode="track" target="car" pos="0 -50 10" fovy="60"/>
+        <camera name="birds_eye" mode="fixed" pos="0 0 60" fovy="90"/>
     </worldbody>
     
     <actuator>

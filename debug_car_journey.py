@@ -77,7 +77,9 @@ def debug_car_journey(model_path: str = None, max_steps: int = 2000):
     
     # Convert to numpy arrays
     positions = np.array(positions)
-    positions[:, :2] *= 50.0  # Un-normalize x/y for plotting
+    # Correct unnormalization
+    positions[:, 0] = ((positions[:, 0] + 1) / 2) * (env.track_a + 10)
+    positions[:, 1] = ((positions[:, 1] + 1) / 2) * (env.track_b + 10)
     actions = np.array(actions)
     
     # Create visualization
@@ -90,11 +92,11 @@ def debug_car_journey(model_path: str = None, max_steps: int = 2000):
     
     # Plot track boundaries (oval)
     theta = np.linspace(0, 2*np.pi, 100)
-    outer_x = (env.track_a + 0.5) * np.cos(theta)  # rough outer
-    outer_y = (env.track_b + 0.5) * np.sin(theta)
+    outer_x = (env.track_a + env.track_width / 2) * np.cos(theta)
+    outer_y = (env.track_b + env.track_width / 2) * np.sin(theta)
     ax1.plot(outer_x, outer_y, 'k--', alpha=0.5, label='Track outer')
-    inner_x = (env.track_a - 0.5) * np.cos(theta)
-    inner_y = (env.track_b - 0.5) * np.sin(theta)
+    inner_x = (env.track_a - env.track_width / 2) * np.cos(theta)
+    inner_y = (env.track_b - env.track_width / 2) * np.sin(theta)
     ax1.plot(inner_x, inner_y, 'k--', alpha=0.5, label='Track inner')
     
     ax1.set_xlabel('X Position (m)')
