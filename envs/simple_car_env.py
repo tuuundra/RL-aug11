@@ -19,11 +19,10 @@ class SimpleCarEnv(gym.Env):
         # Action: [drive_force, steer]
         self.action_space = spaces.Box(low=np.array([-1.0, -1.0]), high=np.array([1.0, 1.0]), dtype=np.float32)
         
-        # Observation: [pos_x, pos_y, pos_z, vel_x, vel_y, vel_z, angle, 5_lidars]
-        # Normalize positions to ~[-1,1] for track ~ +/- 50m
-        low = np.array([-2]*3 + [-20]*3 + [-np.pi] + [0]*5)
-        high = np.array([2]*3 + [20]*3 + [np.pi] + [100]*5)
-        self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
+        # Observation: [norm_pos_x, norm_pos_y, cos_angle, sin_angle, norm_vel, norm_lidars*5, norm_lap, next_curve_angle]
+        low = np.array([-1.0, -1.0, -1.0, -1.0, 0.0] + [0.0] * 5 + [0.0, 0.0])
+        high = np.array([1.0, 1.0, 1.0, 1.0, 1.0] + [1.0] * 5 + [1.0, 1.0])
+        self.observation_space = spaces.Box(low=low, high=high, shape=(12,), dtype=np.float32)
         
         self.render_mode = render_mode
         self.viewer = None
@@ -34,14 +33,66 @@ class SimpleCarEnv(gym.Env):
         self.steps = 0
         self.max_steps = 5000
         
-        # Track parameters (oval center at 0,0)
-        self.track_a = 30.0  # semi-major x
-        self.track_b = 40.0  # semi-minor y
+        # Track parameters (oval center at 0,0, scaled to match car-RL proportions)
+        self.track_a = 60.0  # semi-major x (doubled for MuJoCo scale)
+        self.track_b = 30.0  # semi-minor y
+        self.track_width = 8.0  # Adjusted for car size
+        
+        # Generate waypoints on centerline
+        self.waypoints = []
+        num_points = 36  # every 10 degrees
+        for i in range(num_points):
+            theta = 2 * math.pi * i / num_points
+            x = self.track_a * math.cos(theta)
+            y = self.track_b * math.sin(theta)
+            self.waypoints.append((x, y))
+        
+        self.current_waypoint = 0
+        self.max_vel = 20.0
+        self.min_vel_threshold = 1.0
+        self.max_lidar_dist = 100.0
         
         # Force scales
-        self.drive_scale = 1500.0
+        self.drive_scale = 5000.0
         self.steer_scale = 300.0
         self.last_steer = 0.0
+        
+    def _ellipse_eq(self, x, y, a, b):
+        return ((x / a) ** 2 + (y / b) ** 2)
+    
+    def _is_on_track(self, x, y):
+        eq = self._ellipse_eq(x, y, self.track_a, self.track_b)
+        dist_to_center = abs(eq - 1.0)
+        return dist_to_center <= (self.track_width / 2.0) / min(self.track_a, self.track_b)  # Approximate width check
+    
+    def _dist_to_centerline(self):
+        min_dist = float('inf')
+        pos_xy = self.data.qpos[0:2]
+        for wx, wy in self.waypoints:
+            dist = math.sqrt((pos_xy[0] - wx)**2 + (pos_xy[1] - wy)**2)
+            if dist < min_dist:
+                min_dist = dist
+        return min_dist
+    
+    def _update_waypoint(self):
+        min_dist = float('inf')
+        pos_xy = self.data.qpos[0:2]
+        closest_idx = 0
+        for i, (wx, wy) in enumerate(self.waypoints):
+            dist = math.sqrt((pos_xy[0] - wx)**2 + (pos_xy[1] - wy)**2)
+            if dist < min_dist:
+                min_dist = dist
+                closest_idx = i
+        if closest_idx > self.current_waypoint or (closest_idx == 0 and self.current_waypoint > len(self.waypoints) // 2):
+            self.current_waypoint = closest_idx
+    
+    def _is_lap_complete(self):
+        pos_xy = self.data.qpos[0:2]
+        if self.current_waypoint >= len(self.waypoints) - 1 and math.sqrt((pos_xy[0] - self.waypoints[0][0])**2 + (pos_xy[1] - self.waypoints[0][1])**2) < 5.0:
+            self.current_lap += 1
+            self.current_waypoint = 0
+            return True
+        return False
         
     def step(self, action):
         drive, steer = np.clip(action, -1.0, 1.0)
@@ -53,12 +104,9 @@ class SimpleCarEnv(gym.Env):
         
         # Apply force in car's forward direction
         quat = np.array(self.data.qpos[3:7]).reshape(4, 1)
-        # Build rotation matrix from quaternion (row-major)
         mat = np.zeros((3, 3))
         mujoco.mju_quat2Mat(mat.ravel(), quat.ravel())
-        forward = mat[:, 0]
-        force = forward * forward_force
-        self.data.xfrc_applied[car_body_id, :3] = force
+        self.data.xfrc_applied[car_body_id, :3] = np.dot(mat, np.array([forward_force, 0, 0]))
         
         # Apply yaw torque around z
         self.data.xfrc_applied[car_body_id, 5] = yaw_torque
@@ -67,59 +115,67 @@ class SimpleCarEnv(gym.Env):
         mujoco.mj_step(self.model, self.data)
         self.steps += 1
         
+        self._update_waypoint()
+        
         # Compute observation
         obs = self._get_obs()
         
-        # Reward
-        reward = self._get_reward()
+        # Reward (pass action for penalty)
+        reward = self._get_reward(action)
         
         # Termination checks
-        done = self.current_lap >= self.total_laps or self.steps >= self.max_steps
+        terminated = self.current_lap >= self.total_laps or self.steps >= self.max_steps or not self._is_on_track(self.data.qpos[0], self.data.qpos[1])
         truncated = False
         info = {'laps': self.current_lap}
-        
-        # Off-track penalty / termination
-        pos_xy = self.data.qpos[0:2]
-        dist_norm = np.sqrt((pos_xy[0]/self.track_a)**2 + (pos_xy[1]/self.track_b)**2)
-        dist_to_center = abs(dist_norm - 1.0)
-        if dist_norm > 1.2 or self.data.qpos[2] < 0.1:
-            reward -= 50.0
-            done = True
         
         # Clear applied forces for next step
         self.data.xfrc_applied[car_body_id, :] = 0.0
         
-        return obs, reward, done, truncated, info
+        return obs, reward, terminated, truncated, info
     
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         mujoco.mj_resetData(self.model, self.data)
-        # Start position near bottom of oval with slight random yaw
-        self.data.qpos[0] = 0.0
-        self.data.qpos[1] = -35.0
+        
+        # Perturb waypoints for variety
+        original_waypoints = [(self.track_a * math.cos(2 * math.pi * i / 36), self.track_b * math.sin(2 * math.pi * i / 36)) for i in range(36)]
+        self.waypoints = [(x + self.np_random.uniform(-3, 3), y + self.np_random.uniform(-3, 3)) for x, y in original_waypoints]
+        
+        # Start at first waypoint
+        self.data.qpos[0] = self.waypoints[0][0]
+        self.data.qpos[1] = self.waypoints[0][1]
         self.data.qpos[2] = 0.5
-        yaw = self.np_random.uniform(-0.2, 0.2)
-        # Set quaternion from yaw-only (z-rotation)
+        
+        # Set initial angle towards next waypoint
+        next_wp = self.waypoints[1]
+        yaw = math.atan2(next_wp[1] - self.data.qpos[1], next_wp[0] - self.data.qpos[0]) + self.np_random.uniform(-0.2, 0.2)
         cy = math.cos(yaw * 0.5)
         sy = math.sin(yaw * 0.5)
         self.data.qpos[3:7] = np.array([cy, 0.0, 0.0, sy])
+        
         mujoco.mj_forward(self.model, self.data)
         
         self.current_lap = 0
+        self.current_waypoint = 0
+        self.steps = 0
         self.prev_angle = math.atan2(self.data.qpos[1], self.data.qpos[0])
         self.cum_angle = 0.0
-        self.steps = 0
+        
         return self._get_obs(), {}
     
     def _get_obs(self):
-        pos = self.data.qpos[0:3] / np.array([50.0, 50.0, 5.0])  # normalize
-        vel = self.data.qvel[0:3]
-        # Simple yaw angle from quaternion (clamp to avoid nan)
-        q = self.data.qpos[3:7]
-        qw = np.clip(q[0], -1.0, 1.0)
-        angle = 2 * np.arccos(qw) * np.sign(q[3])
+        pos = self.data.qpos[0:2] / np.array([self.track_a + 10, self.track_b + 10]) * 2 - 1  # Normalize to [-1,1]
         
-        # Lidar rays (5 rays)
+        # Angle as cos/sin
+        q = self.data.qpos[3:7]
+        angle = 2 * np.arccos(np.clip(q[0], -1.0, 1.0)) * np.sign(q[3])
+        cos_angle = np.cos(angle)
+        sin_angle = np.sin(angle)
+        
+        # Normalized speed (scalar)
+        vel = np.linalg.norm(self.data.qvel[0:2]) / self.max_vel
+        
+        # Lidar rays normalized to [0,1]
         lidars = []
         ray_angles = np.deg2rad([-60, -30, 0, 30, 60])
         pnt = np.array(self.data.qpos[0:3]).reshape(3, 1)
@@ -127,55 +183,89 @@ class SimpleCarEnv(gym.Env):
         for da in ray_angles:
             dir_vec = np.array([np.cos(angle + da), np.sin(angle + da), 0.0]).reshape(3, 1)
             dist = mujoco.mj_ray(self.model, self.data, pnt, dir_vec, None, 1, -1, geomid)
-            # Cap and normalize distance roughly to [0,100]
-            lidars.append(min(dist, 100.0) if dist >= 0 else 100.0)
+            capped = min(max(dist, 0), self.max_lidar_dist) / self.max_lidar_dist  # [0,1]
+            lidars.append(capped)
         
-        return np.concatenate([pos, vel, [angle], lidars]).astype(np.float32)
+        norm_lap = self.current_lap / self.total_laps
+        
+        next_curve_angle = 0.0
+        if self.current_waypoint + 2 < len(self.waypoints):
+            next_idx = (self.current_waypoint + 1) % len(self.waypoints)
+            next_next_idx = (next_idx + 1) % len(self.waypoints)
+            vec1 = np.array(self.waypoints[next_idx]) - np.array(self.waypoints[self.current_waypoint])
+            vec2 = np.array(self.waypoints[next_next_idx]) - np.array(self.waypoints[next_idx])
+            next_curve_angle = np.arccos(np.clip(np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2) + 1e-8), -1.0, 1.0)) / np.pi  # [0,1]
+        
+        return np.array([pos[0], pos[1], cos_angle, sin_angle, vel] + lidars + [norm_lap, next_curve_angle]).astype(np.float32)
     
-    def _get_reward(self):
-        # Position and centre distance
+    def _get_reward(self, action):
         pos_xy = self.data.qpos[0:2]
-        dist_norm = np.sqrt((pos_xy[0]/self.track_a)**2 + (pos_xy[1]/self.track_b)**2)
-        dist_to_center = abs(dist_norm - 1.0)
-
-        # Forward progress incentive (dot product of velocity with track tangent)
-        vel_vec = self.data.cvel[1, 0:2].copy()  # car body (id=1) linear x,y
-        # Track tangent at current position (for an ellipse x^2/a^2 + y^2/b^2 =1)
-        if np.linalg.norm(vel_vec) > 1e-6:
-            tangent = np.array([-pos_xy[1] / (self.track_b ** 2), pos_xy[0] / (self.track_a ** 2)])
-            tangent /= (np.linalg.norm(tangent) + 1e-8)
-            forward_speed = np.dot(vel_vec, tangent)
+        car_angle = 2 * np.arccos(np.clip(self.data.qpos[3], -1.0, 1.0)) * np.sign(self.data.qpos[6])
+        car_vel = np.linalg.norm(self.data.qvel[0:2])
+        drive, steer = np.clip(action, -1.0, 1.0)  # Assuming action available; if not, pass from step
+        
+        reward = 0.0
+        
+        if not self._is_on_track(pos_xy[0], pos_xy[1]):
+            reward = -100.0
         else:
-            forward_speed = 0.0
-        reward = forward_speed  # 1.0 multiplier
+            dist_to_center = self._dist_to_centerline()
+            next_idx = (self.current_waypoint + 1) % len(self.waypoints)
+            dir_to_next = np.array([self.waypoints[next_idx][0] - pos_xy[0], self.waypoints[next_idx][1] - pos_xy[1]])
+            norm = np.linalg.norm(dir_to_next)
+            if norm > 0:
+                unit_dir = dir_to_next / norm
+                vel_vec = np.array([np.cos(car_angle) * car_vel, np.sin(car_angle) * car_vel])
+                progress = np.dot(vel_vec, unit_dir)
+                velocity_bonus = (car_vel / self.max_vel) * 0.5
+                stillness_penalty = -0.5 * (1 - car_vel / self.min_vel_threshold) if car_vel < self.min_vel_threshold else 0.0
+                action_penalty = -0.01 * (abs(steer) + abs(drive))
+                
+                # Boundary proximity penalty (using lidars from obs or recompute)
+                lidars = self._get_obs()[5:10].tolist()  # Extract from obs
+                min_lidar = min(lidars) * self.max_lidar_dist  # Unnormalize
+                boundary_threshold = 10.0
+                boundary_penalty = -0.5 * (boundary_threshold - min_lidar) if min_lidar < boundary_threshold else 0.0
+                
+                # Curve-aware speed penalty
+                curve_penalty = 0.0
+                if self.current_waypoint + 1 < len(self.waypoints):
+                    next_idx = (self.current_waypoint + 1) % len(self.waypoints)
+                    next_next_idx = (next_idx + 1) % len(self.waypoints)
+                    vec1 = np.array(self.waypoints[next_idx]) - np.array(self.waypoints[self.current_waypoint])
+                    vec2 = np.array(self.waypoints[next_next_idx]) - np.array(self.waypoints[next_idx])
+                    angle = np.arccos(np.clip(np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2) + 1e-8), -1.0, 1.0))
+                    if angle > np.radians(45) and car_vel > 10.0:
+                        curve_penalty = -0.2 * (car_vel - 10.0)
+                
+                # Anticipation penalty
+                anticipation_penalty = 0.0
+                if self.current_waypoint + 2 < len(self.waypoints):
+                    next_idx = (self.current_waypoint + 1) % len(self.waypoints)
+                    next_next_idx = (next_idx + 1) % len(self.waypoints)
+                    vec1 = np.array(self.waypoints[next_idx]) - np.array(self.waypoints[self.current_waypoint])
+                    vec2 = np.array(self.waypoints[next_next_idx]) - np.array(self.waypoints[next_idx])
+                    angle = np.arccos(np.clip(np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2) + 1e-8), -1.0, 1.0))
+                    if angle > np.radians(45) and car_vel > 8.0:
+                        anticipation_penalty = -0.1 * (car_vel - 8.0)
+                
+                # Boundary distance normalization penalty
+                avg_lidar = np.mean(lidars) * self.max_lidar_dist
+                optimal_min = 15.0
+                optimal_max = 30.0
+                distance_penalty = 0.0
+                if avg_lidar < optimal_min:
+                    distance_penalty = -0.1 * (optimal_min - avg_lidar)
+                elif avg_lidar > optimal_max:
+                    distance_penalty = -0.1 * (avg_lidar - optimal_max)
+                
+                reward = (2.0 * progress) - 0.5 * dist_to_center + velocity_bonus + stillness_penalty + action_penalty + boundary_penalty + curve_penalty + anticipation_penalty + distance_penalty + 1.0
+            else:
+                reward = -1.0
         
-        # Centerline penalty (quadratic)
-        reward += -10.0 * (dist_to_center ** 2)
+        if self._is_lap_complete():
+            reward += 300.0 / (self.steps + 1)
         
-        # Steering effort penalty (encourage smooth driving)
-        reward += -0.01 * (self.last_steer ** 2)
-        
-        # Lap bonus handled below
-
-        # Lap detection via cumulative angle
-        current_angle = math.atan2(pos_xy[1], pos_xy[0])
-        delta = current_angle - self.prev_angle
-        # unwrap
-        if delta > math.pi:
-            delta -= 2 * math.pi
-        elif delta < -math.pi:
-            delta += 2 * math.pi
-        self.cum_angle += delta
-        self.prev_angle = current_angle
-        
-        # Count full rotations
-        while self.cum_angle >= 2 * math.pi:
-            self.cum_angle -= 2 * math.pi
-            self.current_lap += 1
-            reward += 100.0
-        
-        # Small alive bonus to stabilize learning
-        reward += 0.01
         return float(reward)
     
     def render(self):

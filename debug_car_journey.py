@@ -77,6 +77,7 @@ def debug_car_journey(model_path: str = None, max_steps: int = 2000):
     
     # Convert to numpy arrays
     positions = np.array(positions)
+    positions[:, :2] *= 50.0  # Un-normalize x/y for plotting
     actions = np.array(actions)
     
     # Create visualization
