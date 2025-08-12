@@ -277,7 +277,7 @@ class SimpleCarEnv(gym.Env):
                 self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
             self.viewer.sync()
         elif self.render_mode == 'rgb_array':
-            renderer = mujoco.Renderer(self.model)
+            renderer = mujoco.Renderer(self.model, height=1080, width=1920)
             renderer.update_scene(self.data, camera='birds_eye')
             return renderer.render()
     

@@ -1,23 +1,17 @@
 <mujoco model="simple_car_track">
     <compiler angle="radian" coordinate="local" inertiafromgeom="true"/>
+    <visual>
+        <global offwidth="1920" offheight="1080"/>
+    </visual>
     <option timestep="0.02" gravity="0 0 -9.81"/>
     
     <worldbody>
         <!-- Ground plane -->
-        <geom name="ground" type="plane" size="100 100 1" pos="0 0 0" rgba="0.9 0.9 0.9 1"/>
-        
-        <!-- Simple oval track boundaries (outer and inner walls as boxes) -->
-        <!-- Outer walls -->
-        <geom name="outer_left" type="box" pos="-30 0 2.5" size="2 42.5 2.5" rgba="0.5 0.5 0.5 1"/>
-        <geom name="outer_right" type="box" pos="30 0 2.5" size="2 42.5 2.5" rgba="0.5 0.5 0.5 1"/>
-        <geom name="outer_top" type="box" pos="0 42.5 2.5" size="32 2 2.5" rgba="0.5 0.5 0.5 1"/>
-        <geom name="outer_bottom" type="box" pos="0 -42.5 2.5" size="32 2 2.5" rgba="0.5 0.5 0.5 1"/>
-        
-        <!-- Inner walls (smaller oval) -->
-        <geom name="inner_left" type="box" pos="-20 0 2.5" size="1.5 27.5 2.5" rgba="0.5 0.5 0.5 1"/>
-        <geom name="inner_right" type="box" pos="20 0 2.5" size="1.5 27.5 2.5" rgba="0.5 0.5 0.5 1"/>
-        <geom name="inner_top" type="box" pos="0 27.5 2.5" size="21.5 1.5 2.5" rgba="0.5 0.5 0.5 1"/>
-        <geom name="inner_bottom" type="box" pos="0 -27.5 2.5" size="21.5 1.5 2.5" rgba="0.5 0.5 0.5 1"/>
+        <geom name="ground" type="plane" size="100 100 1" pos="0 0 0" rgba="1 1 1 1"/>
+
+        <!-- Track Visuals: A gray outer oval with a white inner oval on top -->
+        <geom name="track_outer" type="ellipsoid" pos="0 0 0.01" size="64 34 0.01" rgba="0.3 0.3 0.3 1" contype="0" conaffinity="0"/>
+        <geom name="track_inner" type="ellipsoid" pos="0 0 0.02" size="56 26 0.01" rgba="1 1 1 1" contype="0" conaffinity="0"/>
         
         <!-- Car body -->
         <body name="car" pos="0 -35 0.5">
