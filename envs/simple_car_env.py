@@ -44,11 +44,11 @@ class SimpleCarEnv(gym.Env):
         self.a_inner = self.track_a - self.track_width / 2.0  # 56.0
         self.b_inner = self.track_b - self.track_width / 2.0  # 26.0
         
-        # Generate waypoints on centerline
+        # Generate waypoints on centerline (CLOCKWISE direction)
         self.waypoints = []
         num_points = 36  # every 10 degrees
         for i in range(num_points):
-            theta = 2 * math.pi * i / num_points
+            theta = -2 * math.pi * i / num_points  # NEGATIVE for clockwise
             x = self.track_a * math.cos(theta)
             y = self.track_b * math.sin(theta)
             self.waypoints.append((x, y))
@@ -58,9 +58,9 @@ class SimpleCarEnv(gym.Env):
         self.min_vel_threshold = 1.0
         self.max_lidar_dist = 100.0
         
-        # Optimized force scales for smooth car physics
-        self.drive_scale = 800.0  # Reduced for smoother acceleration
-        self.steer_scale = 80.0   # Reduced for more controllable steering
+        # Optimized force scales for realistic racing speeds
+        self.drive_scale = 1400.0  # Increased for better acceleration
+        self.steer_scale = 100.0   # Slightly increased for better control
         self.last_steer = 0.0
         
     def _ellipse_eq(self, x, y, a, b):
@@ -72,6 +72,25 @@ class SimpleCarEnv(gym.Env):
         eq_outer = self._ellipse_eq(x, y, self.a_outer, self.b_outer)
         eq_inner = self._ellipse_eq(x, y, self.a_inner, self.b_inner)
         return eq_outer <= 1.0 and eq_inner >= 1.0
+    
+    def _cast_lidar_ray(self, start_x, start_y, dir_x, dir_y):
+        """Cast a lidar ray and find distance to track boundary using ellipse intersection"""
+        # Step along the ray until we hit a boundary
+        step_size = 0.5  # Small steps for accuracy
+        dist = 0.0
+        
+        while dist < self.max_lidar_dist:
+            # Current position along ray
+            px = start_x + dist * dir_x
+            py = start_y + dist * dir_y
+            
+            # Check if we've hit a boundary (outside track)
+            if not self._is_on_track(px, py):
+                return dist
+            
+            dist += step_size
+        
+        return self.max_lidar_dist  # No boundary hit within max range
     
     def _dist_to_centerline(self):
         min_dist = float('inf')
@@ -110,9 +129,9 @@ class SimpleCarEnv(gym.Env):
         forward_force = drive * self.drive_scale
         yaw_torque = steer * self.steer_scale
         
-        # Add velocity-dependent air resistance for realism
+        # Add velocity-dependent air resistance for realism (reduced)
         current_vel = np.linalg.norm(self.data.qvel[:2])
-        air_resistance = -0.1 * current_vel * current_vel  # Quadratic air resistance
+        air_resistance = -0.03 * current_vel * current_vel  # Reduced quadratic air resistance
         
         yaw = self.data.qpos[2]
         forward_dir = np.array([np.cos(yaw), np.sin(yaw), 0.0])
@@ -149,21 +168,26 @@ class SimpleCarEnv(gym.Env):
         super().reset(seed=seed)
         mujoco.mj_resetData(self.model, self.data)
         
-        # Perturb waypoints for variety
-        original_waypoints = [(self.track_a * math.cos(2 * math.pi * i / 36),
-                               self.track_b * math.sin(2 * math.pi * i / 36))
+        # Perturb waypoints for variety (CLOCKWISE direction)
+        original_waypoints = [(self.track_a * math.cos(-2 * math.pi * i / 36),
+                               self.track_b * math.sin(-2 * math.pi * i / 36))
                               for i in range(36)]
 
         # Keep variety for the path but spawn exactly on the centre-line
         self.waypoints = [(x + self.np_random.uniform(-3, 3), y + self.np_random.uniform(-3, 3))
                           for x, y in original_waypoints]
 
-        # Start at bottom centre of oval
-        self.data.qpos[0] = 0.0
-        self.data.qpos[1] = -self.track_b
-        self.data.qpos[2] = 0.0  # yaw
-        # Small random yaw perturbation around forward (+x)
-        self.data.qpos[2] = self.np_random.uniform(-0.1, 0.1)
+        # Start at first waypoint position (like Pygame version)
+        start_waypoint = original_waypoints[0]  # Use unperturbed waypoint for consistent start
+        self.data.qpos[0] = start_waypoint[0]
+        self.data.qpos[1] = start_waypoint[1]
+        
+        # Set initial orientation to point toward next waypoint (like Pygame version)
+        next_waypoint = original_waypoints[1]
+        dx = next_waypoint[0] - start_waypoint[0]
+        dy = next_waypoint[1] - start_waypoint[1]
+        initial_yaw = math.atan2(dy, dx)
+        self.data.qpos[2] = initial_yaw
         
         mujoco.mj_forward(self.model, self.data)
         
@@ -229,32 +253,37 @@ class SimpleCarEnv(gym.Env):
         # Normalized speed (scalar)
         vel = np.linalg.norm(self.data.qvel[0:2]) / self.max_vel
         
-        # Lidar rays normalized to [0,1]
+        # Custom lidar using ellipse boundary math (like Pygame version)
         lidars = []
         ray_angles = np.deg2rad([-60, -30, 0, 30, 60])
-        pnt = np.array(self.data.qpos[0:3]).reshape(3, 1)
-        geomid = np.array([-1], dtype=np.int32).reshape(1, 1)
         ray_dirs = []
         ray_dists = []
-        car_pos = self.data.qpos[0:3].copy()
-        # Rotation matrix from car body quaternion
+        car_pos = self.data.qpos[0:2]  # Only x,y needed
         yaw = self.data.qpos[2]
-        body_mat = np.array([[ np.cos(yaw), np.sin(yaw), 0],
-                             [-np.sin(yaw), np.cos(yaw), 0],
-                             [          0,           0, 1]])
+        
         for da in ray_angles:
-            dir_vec = np.array([np.cos(yaw + da), np.sin(yaw + da), 0.0]).reshape(3, 1)
-            dist = mujoco.mj_ray(self.model, self.data, pnt, dir_vec, None, 1, -1, geomid)
+            # Calculate ray direction
+            ray_yaw = yaw + da
+            dir_x = np.cos(ray_yaw)
+            dir_y = np.sin(ray_yaw)
+            
+            # Cast ray using ellipse intersection (like original Pygame lidar)
+            dist = self._cast_lidar_ray(car_pos[0], car_pos[1], dir_x, dir_y)
+            
             capped = min(max(dist, 0), self.max_lidar_dist)
             lidars.append(capped / self.max_lidar_dist)
-            ray_dirs.append(dir_vec.ravel())
+            ray_dirs.append(np.array([dir_x, dir_y, 0.0]))
             ray_dists.append(capped)
 
         # Update lidar tip site positions (local frame)
+        car_pos_3d = self.data.qpos[0:3].copy()  # Use 3D position for visualization
+        body_mat = np.array([[ np.cos(yaw), np.sin(yaw), 0],
+                             [-np.sin(yaw), np.cos(yaw), 0],
+                             [          0,           0, 1]])
         for i, (dvec, dlen) in enumerate(zip(ray_dirs, ray_dists)):
             tip_id = self.model.site(f'lidar_tip_{i}').id
-            world_end = car_pos + dvec * dlen
-            local_end = body_mat.T @ (world_end - car_pos)
+            world_end = car_pos_3d + dvec * dlen
+            local_end = body_mat.T @ (world_end - car_pos_3d)
             self.model.site_pos[tip_id] = local_end
         
         # Update visualization
@@ -294,15 +323,19 @@ class SimpleCarEnv(gym.Env):
                 unit_dir = dir_to_next / norm
                 vel_vec = np.array([np.cos(car_angle) * car_vel, np.sin(car_angle) * car_vel])
                 progress = np.dot(vel_vec, unit_dir)
-                velocity_bonus = (car_vel / self.max_vel) * 0.5
+                velocity_bonus = (car_vel / self.max_vel) * 2.0  # Increased from 0.5 to 2.0
                 stillness_penalty = -0.5 * (1 - car_vel / self.min_vel_threshold) if car_vel < self.min_vel_threshold else 0.0
                 action_penalty = -0.01 * (abs(steer) + abs(drive))
                 
                 # Boundary proximity penalty (using lidars from obs or recompute)
                 lidars = self._get_obs()[5:10].tolist()  # Extract from obs
                 min_lidar = min(lidars) * self.max_lidar_dist  # Unnormalize
-                boundary_threshold = 10.0
-                boundary_penalty = -0.5 * (boundary_threshold - min_lidar) if min_lidar < boundary_threshold else 0.0
+                # Enhanced boundary penalty for crash prevention
+                boundary_penalty = 0.0
+                if min_lidar < 15.0:  # Increased safe distance
+                    boundary_penalty = -1.0 * (15.0 - min_lidar)  # Stronger penalty
+                if min_lidar < 5.0:  # Very close to walls
+                    boundary_penalty = -5.0 * (5.0 - min_lidar)  # Much stronger penalty
                 
                 # Curve-aware speed penalty
                 curve_penalty = 0.0
@@ -326,17 +359,38 @@ class SimpleCarEnv(gym.Env):
                     if angle > np.radians(45) and car_vel > 8.0:
                         anticipation_penalty = -0.1 * (car_vel - 8.0)
                 
-                # Boundary distance normalization penalty
+                # Enhanced lidar-based navigation rewards
                 avg_lidar = np.mean(lidars) * self.max_lidar_dist
+                min_lidar = min(lidars) * self.max_lidar_dist
+                
+                # 1. Optimal distance maintenance (stronger reward)
                 optimal_min = 15.0
                 optimal_max = 30.0
                 distance_penalty = 0.0
                 if avg_lidar < optimal_min:
-                    distance_penalty = -0.1 * (optimal_min - avg_lidar)
+                    distance_penalty = -0.2 * (optimal_min - avg_lidar)  # Increased penalty
                 elif avg_lidar > optimal_max:
-                    distance_penalty = -0.1 * (avg_lidar - optimal_max)
+                    distance_penalty = -0.2 * (avg_lidar - optimal_max)
                 
-                reward = (2.0 * progress) - 0.5 * dist_to_center + velocity_bonus + stillness_penalty + action_penalty + boundary_penalty + curve_penalty + anticipation_penalty + distance_penalty + 1.0
+                # 2. Lidar-guided steering reward (NEW)
+                lidar_steering_reward = 0.0
+                left_lidar = (lidars[0] + lidars[1]) * self.max_lidar_dist / 2  # Average of left sensors
+                right_lidar = (lidars[3] + lidars[4]) * self.max_lidar_dist / 2  # Average of right sensors
+                
+                # Reward steering toward more open space
+                if abs(left_lidar - right_lidar) > 5.0:  # Significant difference
+                    if left_lidar > right_lidar and steer > 0:  # More space left, steering left
+                        lidar_steering_reward = 0.5
+                    elif right_lidar > left_lidar and steer < 0:  # More space right, steering right  
+                        lidar_steering_reward = 0.5
+                
+                # 3. Speed bonus based on available space (NEW)
+                forward_lidar = lidars[2] * self.max_lidar_dist  # Center sensor
+                space_speed_bonus = 0.0
+                if forward_lidar > 20.0:  # Lots of space ahead
+                    space_speed_bonus = min(car_vel / 10.0, 1.0)  # Reward higher speeds
+                
+                reward = (2.0 * progress) - 0.5 * dist_to_center + velocity_bonus + stillness_penalty + action_penalty + boundary_penalty + curve_penalty + anticipation_penalty + distance_penalty + lidar_steering_reward + space_speed_bonus + 1.0
             else:
                 reward = -1.0
         
