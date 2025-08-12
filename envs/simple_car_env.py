@@ -52,9 +52,9 @@ class SimpleCarEnv(gym.Env):
         self.min_vel_threshold = 1.0
         self.max_lidar_dist = 100.0
         
-        # Force scales tuned for 2-D planar cart
-        self.drive_scale = 1500.0
-        self.steer_scale = 150.0
+        # Optimized force scales for smooth car physics
+        self.drive_scale = 800.0  # Reduced for smoother acceleration
+        self.steer_scale = 80.0   # Reduced for more controllable steering
         self.last_steer = 0.0
         
     def _ellipse_eq(self, x, y, a, b):
@@ -101,16 +101,22 @@ class SimpleCarEnv(gym.Env):
         drive, steer = np.clip(action, -1.0, 1.0)
         car_body_id = self.model.body('car').id
         
-        # Apply simple forces
+        # Apply physics-optimized forces with velocity damping
         forward_force = drive * self.drive_scale
         yaw_torque = steer * self.steer_scale
         
+        # Add velocity-dependent air resistance for realism
+        current_vel = np.linalg.norm(self.data.qvel[:2])
+        air_resistance = -0.1 * current_vel * current_vel  # Quadratic air resistance
+        
         yaw = self.data.qpos[2]
         forward_dir = np.array([np.cos(yaw), np.sin(yaw), 0.0])
-        self.data.xfrc_applied[car_body_id, :3] = forward_dir * forward_force
+        total_force = (forward_force + air_resistance)
+        self.data.xfrc_applied[car_body_id, :3] = forward_dir * total_force
         
-        # Apply yaw torque around z
-        self.data.xfrc_applied[car_body_id, 5] = yaw_torque
+        # Apply yaw torque with velocity-dependent scaling for better control
+        speed_factor = min(1.0, current_vel / 10.0)  # Reduce steering at low speeds
+        self.data.xfrc_applied[car_body_id, 5] = yaw_torque * (0.3 + 0.7 * speed_factor)
         self.last_steer = steer
         
         mujoco.mj_step(self.model, self.data)
