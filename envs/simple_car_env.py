@@ -38,6 +38,12 @@ class SimpleCarEnv(gym.Env):
         self.track_b = 30.0  # semi-minor y
         self.track_width = 8.0  # Adjusted for car size
         
+        # Fixed boundary ellipses (like Pygame version - NEVER change)
+        self.a_outer = self.track_a + self.track_width / 2.0  # 64.0
+        self.b_outer = self.track_b + self.track_width / 2.0  # 34.0
+        self.a_inner = self.track_a - self.track_width / 2.0  # 56.0
+        self.b_inner = self.track_b - self.track_width / 2.0  # 26.0
+        
         # Generate waypoints on centerline
         self.waypoints = []
         num_points = 36  # every 10 degrees
@@ -58,15 +64,14 @@ class SimpleCarEnv(gym.Env):
         self.last_steer = 0.0
         
     def _ellipse_eq(self, x, y, a, b):
-        return ((x / a) ** 2 + (y / b) ** 2)
+        """Calculate ellipse equation value for point (x,y) with semi-axes a,b"""
+        return (x / a) ** 2 + (y / b) ** 2
     
     def _is_on_track(self, x, y):
-        min_dist = float('inf')
-        for wx, wy in self.waypoints:
-            dist = math.sqrt((x - wx)**2 + (y - wy)**2)
-            if dist < min_dist:
-                min_dist = dist
-        return min_dist <= self.track_width / 2.0
+        """Check if position is within track boundaries using ellipse math (like Pygame)"""
+        eq_outer = self._ellipse_eq(x, y, self.a_outer, self.b_outer)
+        eq_inner = self._ellipse_eq(x, y, self.a_inner, self.b_inner)
+        return eq_outer <= 1.0 and eq_inner >= 1.0
     
     def _dist_to_centerline(self):
         min_dist = float('inf')
