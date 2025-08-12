@@ -52,9 +52,9 @@ class SimpleCarEnv(gym.Env):
         self.min_vel_threshold = 1.0
         self.max_lidar_dist = 100.0
         
-        # Force scales
-        self.drive_scale = 5000.0
-        self.steer_scale = 300.0
+        # Force scales tuned for 2-D planar cart
+        self.drive_scale = 1500.0
+        self.steer_scale = 150.0
         self.last_steer = 0.0
         
     def _ellipse_eq(self, x, y, a, b):
@@ -105,11 +105,9 @@ class SimpleCarEnv(gym.Env):
         forward_force = drive * self.drive_scale
         yaw_torque = steer * self.steer_scale
         
-        # Apply force in car's forward direction
-        quat = np.array(self.data.qpos[3:7]).reshape(4, 1)
-        mat = np.zeros((3, 3))
-        mujoco.mju_quat2Mat(mat.ravel(), quat.ravel())
-        self.data.xfrc_applied[car_body_id, :3] = np.dot(mat, np.array([forward_force, 0, 0]))
+        yaw = self.data.qpos[2]
+        forward_dir = np.array([np.cos(yaw), np.sin(yaw), 0.0])
+        self.data.xfrc_applied[car_body_id, :3] = forward_dir * forward_force
         
         # Apply yaw torque around z
         self.data.xfrc_applied[car_body_id, 5] = yaw_torque
@@ -141,20 +139,20 @@ class SimpleCarEnv(gym.Env):
         mujoco.mj_resetData(self.model, self.data)
         
         # Perturb waypoints for variety
-        original_waypoints = [(self.track_a * math.cos(2 * math.pi * i / 36), self.track_b * math.sin(2 * math.pi * i / 36)) for i in range(36)]
-        self.waypoints = [(x + self.np_random.uniform(-3, 3), y + self.np_random.uniform(-3, 3)) for x, y in original_waypoints]
-        
-        # Start at first waypoint
-        self.data.qpos[0] = self.waypoints[0][0]
-        self.data.qpos[1] = self.waypoints[0][1]
-        self.data.qpos[2] = 0.5
-        
-        # Set initial angle towards next waypoint
-        next_wp = self.waypoints[1]
-        yaw = math.atan2(next_wp[1] - self.data.qpos[1], next_wp[0] - self.data.qpos[0]) + self.np_random.uniform(-0.2, 0.2)
-        cy = math.cos(yaw * 0.5)
-        sy = math.sin(yaw * 0.5)
-        self.data.qpos[3:7] = np.array([cy, 0.0, 0.0, sy])
+        original_waypoints = [(self.track_a * math.cos(2 * math.pi * i / 36),
+                               self.track_b * math.sin(2 * math.pi * i / 36))
+                              for i in range(36)]
+
+        # Keep variety for the path but spawn exactly on the centre-line
+        self.waypoints = [(x + self.np_random.uniform(-3, 3), y + self.np_random.uniform(-3, 3))
+                          for x, y in original_waypoints]
+
+        # Start at bottom centre of oval
+        self.data.qpos[0] = 0.0
+        self.data.qpos[1] = -self.track_b
+        self.data.qpos[2] = 0.0  # yaw
+        # Small random yaw perturbation around forward (+x)
+        self.data.qpos[2] = self.np_random.uniform(-0.1, 0.1)
         
         mujoco.mj_forward(self.model, self.data)
         
@@ -166,14 +164,56 @@ class SimpleCarEnv(gym.Env):
         
         return self._get_obs(), {}
     
+    def _update_lidar_visuals(self, ray_dirs: np.ndarray, ray_dists: np.ndarray) -> None:
+        """Update green capsule geoms to match lidar rays (visual only)."""
+        # Car origin in world
+        car_pos = self.data.qpos[0:3].copy()
+        ray_dirs = np.asarray(ray_dirs).reshape(-1, 3)
+        ray_dists = np.asarray(ray_dists).reshape(-1)
+        z_axis = np.array([0.0, 0.0, 1.0])
+        quat = np.zeros(4)
+        for i in range(5):
+            name = f"lidar_ray_{i}"
+            try:
+                gid = self.model.geom(name).id
+            except Exception:
+                continue
+            length = float(max(ray_dists[i], 1e-6))
+            direction = ray_dirs[i]
+            norm = np.linalg.norm(direction)
+            if norm < 1e-8:
+                direction = z_axis
+            else:
+                direction = direction / norm
+            # Compute quaternion rotating z-axis to direction
+            c = float(np.dot(z_axis, direction))
+            if c > 0.9999:
+                # Aligned
+                quat[:] = np.array([1.0, 0.0, 0.0, 0.0])
+            elif c < -0.9999:
+                # Opposite
+                axis = np.array([1.0, 0.0, 0.0])
+                mujoco.mju_axisAngle2Quat(quat, axis, np.pi)
+            else:
+                axis = np.cross(z_axis, direction)
+                axis = axis / (np.linalg.norm(axis) + 1e-8)
+                angle = float(np.arccos(np.clip(c, -1.0, 1.0)))
+                mujoco.mju_axisAngle2Quat(quat, axis, angle)
+            # Center point
+            center = car_pos + 0.5 * direction * length
+            # Update geom pose and size (capsule size: [radius, half-length])
+            self.model.geom_pos[gid] = center
+            self.model.geom_quat[gid] = quat
+            self.model.geom_size[gid, 0] = 0.05  # radius
+            self.model.geom_size[gid, 1] = length / 2.0  # half-length
+        
     def _get_obs(self):
         pos = self.data.qpos[0:2] / np.array([self.track_a + 10, self.track_b + 10]) * 2 - 1  # Normalize to [-1,1]
         
         # Angle as cos/sin
-        q = self.data.qpos[3:7]
-        angle = 2 * np.arccos(np.clip(q[0], -1.0, 1.0)) * np.sign(q[3])
-        cos_angle = np.cos(angle)
-        sin_angle = np.sin(angle)
+        yaw = self.data.qpos[2]
+        cos_angle = np.cos(yaw)
+        sin_angle = np.sin(yaw)
         
         # Normalized speed (scalar)
         vel = np.linalg.norm(self.data.qvel[0:2]) / self.max_vel
@@ -183,11 +223,34 @@ class SimpleCarEnv(gym.Env):
         ray_angles = np.deg2rad([-60, -30, 0, 30, 60])
         pnt = np.array(self.data.qpos[0:3]).reshape(3, 1)
         geomid = np.array([-1], dtype=np.int32).reshape(1, 1)
+        ray_dirs = []
+        ray_dists = []
+        car_pos = self.data.qpos[0:3].copy()
+        # Rotation matrix from car body quaternion
+        yaw = self.data.qpos[2]
+        body_mat = np.array([[ np.cos(yaw), np.sin(yaw), 0],
+                             [-np.sin(yaw), np.cos(yaw), 0],
+                             [          0,           0, 1]])
         for da in ray_angles:
-            dir_vec = np.array([np.cos(angle + da), np.sin(angle + da), 0.0]).reshape(3, 1)
+            dir_vec = np.array([np.cos(yaw + da), np.sin(yaw + da), 0.0]).reshape(3, 1)
             dist = mujoco.mj_ray(self.model, self.data, pnt, dir_vec, None, 1, -1, geomid)
-            capped = min(max(dist, 0), self.max_lidar_dist) / self.max_lidar_dist  # [0,1]
-            lidars.append(capped)
+            capped = min(max(dist, 0), self.max_lidar_dist)
+            lidars.append(capped / self.max_lidar_dist)
+            ray_dirs.append(dir_vec.ravel())
+            ray_dists.append(capped)
+
+        # Update lidar tip site positions (local frame)
+        for i, (dvec, dlen) in enumerate(zip(ray_dirs, ray_dists)):
+            tip_id = self.model.site(f'lidar_tip_{i}').id
+            world_end = car_pos + dvec * dlen
+            local_end = body_mat.T @ (world_end - car_pos)
+            self.model.site_pos[tip_id] = local_end
+        
+        # Update visualization
+        try:
+            self._update_lidar_visuals(np.array(ray_dirs), np.array(ray_dists))
+        except Exception:
+            pass
         
         norm_lap = self.current_lap / self.total_laps
         
@@ -203,7 +266,7 @@ class SimpleCarEnv(gym.Env):
     
     def _get_reward(self, action):
         pos_xy = self.data.qpos[0:2]
-        car_angle = 2 * np.arccos(np.clip(self.data.qpos[3], -1.0, 1.0)) * np.sign(self.data.qpos[6])
+        car_angle = self.data.qpos[2]  # yaw only
         car_vel = np.linalg.norm(self.data.qvel[0:2])
         drive, steer = np.clip(action, -1.0, 1.0)  # Assuming action available; if not, pass from step
         
@@ -276,6 +339,7 @@ class SimpleCarEnv(gym.Env):
             if self.viewer is None:
                 self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
             self.viewer.sync()
+            return None
         elif self.render_mode == 'rgb_array':
             renderer = mujoco.Renderer(self.model, height=1080, width=1920)
             renderer.update_scene(self.data, camera='birds_eye')

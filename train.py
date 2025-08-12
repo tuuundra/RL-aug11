@@ -20,7 +20,7 @@ def main():
     )
     
     # Train
-    model.learn(total_timesteps=100_000)
+    model.learn(total_timesteps=300_000)
     
     # Save in new run folder
     os.makedirs('runs', exist_ok=True)

@@ -10,14 +10,30 @@
         <geom name="ground" type="plane" size="100 100 1" pos="0 0 0" rgba="1 1 1 1"/>
 
         <!-- Track Visuals: A gray outer oval with a white inner oval on top -->
-        <geom name="track_outer" type="ellipsoid" pos="0 0 0.01" size="64 34 0.01" rgba="0.3 0.3 0.3 1" contype="0" conaffinity="0"/>
+        <geom name="track_outer" type="ellipsoid" pos="0 0 0.01" size="64 34 0.01" rgba="0.6 0.6 0.6 1" contype="0" conaffinity="0"/>
         <geom name="track_inner" type="ellipsoid" pos="0 0 0.02" size="56 26 0.01" rgba="1 1 1 1" contype="0" conaffinity="0"/>
         
+        <!-- Invisible walls for precise lidar collisions -->
+        <geom name="outer_wall" type="ellipsoid" pos="0 0 1.2" size="64 34 0.2" rgba="0 0 0 0" contype="0" conaffinity="0"/>
+        <geom name="inner_wall" type="ellipsoid" pos="0 0 1.2" size="56 26 0.2" rgba="0 0 0 0" contype="0" conaffinity="0"/>
+        
         <!-- Car body -->
-        <body name="car" pos="0 -35 0.5">
-            <joint type="free" name="car_joint" damping="0.1"/>
+        <body name="car" pos="0 0 0.5">
+            <joint name="x_slide" type="slide" axis="1 0 0" damping="1"/>
+            <joint name="y_slide" type="slide" axis="0 1 0" damping="1"/>
+            <joint name="yaw"     type="hinge" axis="0 0 1" damping="0.5"/>
             <geom name="car_body" type="box" size="0.6 1.0 0.3" mass="200" friction="0.5 0.005 0.0001" rgba="1 0 0 1"/>
-            <!-- Actuators will be applied via code -->
+            <!-- Lidar Geoms Attached to Car Body -->
+            <geom name="lidar_ray_0" type="capsule" fromto="0 0 0.2 1 0 0.2" size="0.05" rgba="0 1 0 0.5" contype="0" conaffinity="0"/>
+            <geom name="lidar_ray_1" type="capsule" fromto="0 0 0.2 1 0 0.2" size="0.05" rgba="0 1 0 0.5" contype="0" conaffinity="0"/>
+            <geom name="lidar_ray_2" type="capsule" fromto="0 0 0.2 1 0 0.2" size="0.05" rgba="0 1 0 0.5" contype="0" conaffinity="0"/>
+            <geom name="lidar_ray_3" type="capsule" fromto="0 0 0.2 1 0 0.2" size="0.05" rgba="0 1 0 0.5" contype="0" conaffinity="0"/>
+            <geom name="lidar_ray_4" type="capsule" fromto="0 0 0.2 1 0 0.2" size="0.05" rgba="0 1 0 0.5" contype="0" conaffinity="0"/>
+            <site name="lidar_tip_0" type="sphere" pos="0 0 0.2" size="0.1" rgba="0 1 0 1"/>
+            <site name="lidar_tip_1" type="sphere" pos="0 0 0.2" size="0.1" rgba="0 1 0 1"/>
+            <site name="lidar_tip_2" type="sphere" pos="0 0 0.2" size="0.1" rgba="0 1 0 1"/>
+            <site name="lidar_tip_3" type="sphere" pos="0 0 0.2" size="0.1" rgba="0 1 0 1"/>
+            <site name="lidar_tip_4" type="sphere" pos="0 0 0.2" size="0.1" rgba="0 1 0 1"/>
         </body>
         
         <!-- Following camera -->
