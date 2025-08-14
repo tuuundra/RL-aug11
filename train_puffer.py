@@ -12,7 +12,7 @@ def make_env():
 def main():
     # Configuration
     num_envs = 8  # Number of parallel environments
-    total_timesteps = 2_000_000  # Extended training for improved convergence
+    total_timesteps = 100_000  # Quick test after steering boost
     
     print(f"Creating {num_envs} parallel environments...")
     

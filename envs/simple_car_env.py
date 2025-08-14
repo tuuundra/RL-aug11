@@ -16,8 +16,8 @@ class SimpleCarEnv(gym.Env):
         self.model = mujoco.MjModel.from_xml_path(model_path)
         self.data = mujoco.MjData(self.model)
         
-        # Action: [drive_force, steer]
-        self.action_space = spaces.Box(low=np.array([-1.0, -1.0]), high=np.array([1.0, 1.0]), dtype=np.float32)
+        # Action: [drive_force, steer]. Allow slight braking up to -2 units
+        self.action_space = spaces.Box(low=np.array([-2.0, -1.0]), high=np.array([1.0, 1.0]), dtype=np.float32)
         
         # Observation: [norm_pos_x, norm_pos_y, cos_angle, sin_angle, norm_vel, norm_lidars*5, norm_lap, next_curve_angle]
         low = np.array([-1.0, -1.0, -1.0, -1.0, 0.0] + [0.0] * 5 + [0.0, 0.0])
@@ -67,7 +67,7 @@ class SimpleCarEnv(gym.Env):
         
         # Optimized force scales for realistic racing speeds
         self.drive_scale = 400.0   # Moderated: ≈2.7 m/s² acceleration (150 kg)
-        self.steer_scale = 40.0    # Moderated: milder yaw torque
+        self.steer_scale = 80.0    # Increased: stronger yaw torque for curves
         self.last_steer = 0.0
         
     def _ellipse_eq(self, x, y, a, b):
@@ -316,6 +316,10 @@ class SimpleCarEnv(gym.Env):
             ray_dirs.append(np.array([dir_x, dir_y, 0.0]))
             ray_dists.append(capped)
 
+        # --- NEW: lidar-based curve indicator (left rays minus right rays) ---
+        curve_ind = (lidars[0] + lidars[1]) - (lidars[3] + lidars[4])  # range approximately [-2, 2]
+        curve_ind_norm = float(np.clip(curve_ind, -1.0, 1.0))
+        
         # Update lidar tip site positions (local frame)
         car_pos_3d = self.data.qpos[0:3].copy()  # Use 3D position for visualization
         body_mat = np.array([[ np.cos(yaw), np.sin(yaw), 0],
@@ -343,13 +347,15 @@ class SimpleCarEnv(gym.Env):
             vec2 = np.array(self.waypoints[next_next_idx]) - np.array(self.waypoints[next_idx])
             next_curve_angle = np.arccos(np.clip(np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2) + 1e-8), -1.0, 1.0)) / np.pi  # [0,1]
         
-        return np.array([pos[0], pos[1], cos_angle, sin_angle, vel] + lidars + [norm_lap, next_curve_angle]).astype(np.float32)
+        # Replace next_curve_angle in observation with sensor-derived curve indicator
+        return np.array([pos[0], pos[1], cos_angle, sin_angle, vel] + lidars + [norm_lap, curve_ind_norm]).astype(np.float32)
     
     def _get_reward(self, action):
         """IMPROVED REWARD SYSTEM - Fixed critical issues"""
         pos_xy = self.data.qpos[0:2]
         car_angle = self.data.qpos[2]
         car_vel = np.linalg.norm(self.data.qvel[0:2])
+        drive = action[0]  # Throttle value for brake reward
         
         # Off-track termination
         if not self._is_on_track(pos_xy[0], pos_xy[1]):
@@ -357,6 +363,8 @@ class SimpleCarEnv(gym.Env):
         
         # Get lidar readings for safety
         lidars = self._get_obs()[5:10].tolist()
+        # Curve indicator from lidar (same formula as in _get_obs)
+        curve_ind = (lidars[0] + lidars[1]) - (lidars[3] + lidars[4])
         min_lidar = min(lidars) * self.max_lidar_dist
         
         # 1. FORWARD PROGRESS REWARD (Primary driver) - FIXED: Use same waypoints as tracking
@@ -374,84 +382,31 @@ class SimpleCarEnv(gym.Env):
         else:
             progress_reward = 0.0
         
-        # 2. SPEED INCENTIVE (Encourage faster, more confident driving)
-        optimal_speed = 8.0  # Target speed for racing
-        speed_reward = 0.5 * min(car_vel / optimal_speed, 1.0)  # Reward up to optimal speed
-        
-        # 3. CENTERLINE PENALTY (Keep car in middle) - Reduced impact
-        dist_to_center = self._dist_to_centerline()
-        centerline_penalty = -0.1 * dist_to_center  # Reduced penalty for more freedom
-        
-        # 4. WALL SAFETY PENALTY (Based on lidar) - FIXED: Scale-appropriate
+        # 2. SPEED INCENTIVE AND CURVE-AWARE PENALTY --- simplified
+        # --- Simplified reward terms ---
+        # Positive speed incentive (always encourages some movement)
+        speed_reward = 0.3 * np.tanh(car_vel / 4.0)
+
+        # Curve-aware target speed and penalty (only if already moving fast)
+        curve_target_speed = 10.0 - 6.0 * abs(curve_ind)  # 10 m/s straight, 4 m/s tight curve
+        speed_excess = max(0.0, car_vel - curve_target_speed)
+        curve_speed_penalty = -0.3 * speed_excess
+
+        # Wall safety penalty (only if within 3 m of wall)
         safety_penalty = 0.0
-        safety_threshold = 1.0  # Scale-appropriate threshold (1m for 60x30 track)
+        safety_threshold = 3.0
         if min_lidar < safety_threshold:
-            # Gentler penalty that doesn't overwhelm other rewards
-            safety_penalty = -1.0 * (safety_threshold - min_lidar)  # Further reduced
-        
-        # 5. LAP COMPLETION BONUS REMOVED for initial training stability
-        lap_bonus = 0.0
-        
-        # 6. CURVE-AWARE SPEED PENALTY (Like pygame version)
-        curve_penalty = 0.0
-        if self.current_waypoint + 1 < len(self.waypoints):
-            next_idx = (self.current_waypoint + 1) % len(self.waypoints)
-            next_next_idx = (next_idx + 1) % len(self.waypoints)
-            vec1 = np.array(self.waypoints[next_idx]) - np.array(self.waypoints[self.current_waypoint])
-            vec2 = np.array(self.waypoints[next_next_idx]) - np.array(self.waypoints[next_idx])
-            norm1, norm2 = np.linalg.norm(vec1), np.linalg.norm(vec2)
-            if norm1 > 0 and norm2 > 0:
-                cos_angle = np.clip(np.dot(vec1, vec2) / (norm1 * norm2), -1.0, 1.0)
-                angle = np.arccos(cos_angle)
-                if angle > np.radians(45):  # Curve detected
-                    max_curve_speed = 2.0  # Scale-appropriate max speed in curves (vs 10.0 in pygame)
-                    if car_vel > max_curve_speed:
-                        curve_penalty = -0.2 * (car_vel - max_curve_speed)
+            safety_penalty = -2.0 * (safety_threshold - min_lidar)
 
-        # 7. ANTICIPATION PENALTY (Look ahead for curves)
-        anticipation_penalty = 0.0
-        if self.current_waypoint + 2 < len(self.waypoints):
-            next_idx = (self.current_waypoint + 1) % len(self.waypoints)
-            next_next_idx = (next_idx + 1) % len(self.waypoints)
-            vec1 = np.array(self.waypoints[next_idx]) - np.array(self.waypoints[self.current_waypoint])
-            vec2 = np.array(self.waypoints[next_next_idx]) - np.array(self.waypoints[next_idx])
-            norm1, norm2 = np.linalg.norm(vec1), np.linalg.norm(vec2)
-            if norm1 > 0 and norm2 > 0:
-                cos_angle = np.clip(np.dot(vec1, vec2) / (norm1 * norm2), -1.0, 1.0)
-                angle = np.arccos(cos_angle)
-                if angle > np.radians(45):  # Approaching curve
-                    max_approach_speed = 1.6  # Scale-appropriate approach speed (vs 8.0 in pygame)
-                    if car_vel > max_approach_speed:
-                        anticipation_penalty = -0.1 * (car_vel - max_approach_speed)
-
-        # 8. DIRECTIONAL PENALTY (Force clockwise motion)
-        # Penalize movement in wrong direction (counter-clockwise)
-        directional_penalty = 0.0
-        if car_vel > 0.1:  # Only when car is moving
-            # Calculate if car is moving clockwise or counter-clockwise around track center
-            # Vector from track center to car
-            center_to_car = np.array([pos_xy[0], pos_xy[1]])  # Track center at (0,0)
-            # Car velocity vector
-            velocity_vec = np.array([np.cos(car_angle) * car_vel, np.sin(car_angle) * car_vel])
-            # Cross product gives direction of rotation (positive = counter-clockwise, negative = clockwise)
-            cross_product = center_to_car[0] * velocity_vec[1] - center_to_car[1] * velocity_vec[0]
-            
-            if cross_product > 0:  # Counter-clockwise motion
-                directional_penalty = -5.0 * abs(cross_product) / (np.linalg.norm(center_to_car) * car_vel)
-        
-        # Combine and clip final reward to roughly [-1,1]
-        reward = progress_reward + speed_reward + centerline_penalty + safety_penalty + curve_penalty + anticipation_penalty + directional_penalty
+        # Combine and clip final reward
+        reward = progress_reward + speed_reward + curve_speed_penalty + safety_penalty
         reward = float(np.clip(reward, -1.0, 1.0))
-
         # Store breakdown for debugging
         self._last_reward_breakdown = {
             'progress': float(progress_reward),
             'speed': float(speed_reward),
-            'centerline': float(centerline_penalty),
-            'safety': float(safety_penalty),
-            'curve': float(curve_penalty),
-            'anticipation': float(anticipation_penalty),
-            'directional': float(directional_penalty)
+            'curve_penalty': float(curve_speed_penalty),
+            'safety': float(safety_penalty)
         }
         
         return reward

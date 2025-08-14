@@ -40,7 +40,7 @@ def debug_car_journey(model_path: str = None, max_steps: int = 2000):
     rewards = []
     lap_progress = []
     
-    obs, _ = env.reset()
+    obs, _ = env.reset()  # obs[5:10] = lidars, obs[11] = curve_ind_norm
     print("=== DETAILED CAR JOURNEY TRACKING ===")
     print(f"Track dimensions: {env.track_a}×{env.track_b}m oval")
     print(f"Starting position: ({obs[0]:.2f}, {obs[1]:.2f})")
@@ -52,6 +52,11 @@ def debug_car_journey(model_path: str = None, max_steps: int = 2000):
         
         # Step environment
         obs, reward, done, _, info = env.step(action)
+        
+        if step % 100 == 0:
+            lidars = obs[5:10]
+            curve_ind = obs[11] if len(obs) > 11 else 0.0  # Safety check
+            print(f"Step {step}: lidars={lidars}, curve_ind={curve_ind:.3f}")
         
         # Record data
         pos = obs[0:2]  # x,y (ignore z for 2D plot)
