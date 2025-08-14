@@ -8,7 +8,7 @@ import os
 class SimpleCarEnv(gym.Env):
     metadata = {'render_modes': ['human', 'rgb_array']}
     
-    def __init__(self, render_mode=None, total_laps=3):
+    def __init__(self, render_mode=None, total_laps=3, eval_mode=False):
         super().__init__()
         
         # Load model
@@ -27,16 +27,21 @@ class SimpleCarEnv(gym.Env):
         self.render_mode = render_mode
         self.viewer = None
         self.total_laps = total_laps
+        self.eval_mode = eval_mode
         self.current_lap = 0
         self.prev_angle = 0.0
         self.cum_angle = 0.0
         self.steps = 0
         self.max_steps = 5000
         
+        # Lap completion tracking
+        self.last_lap_step = 0  # Step count when last lap was completed
+        self.min_steps_per_lap = 300  # Minimum steps required between laps
+        
         # Track parameters (oval center at 0,0, scaled to match car-RL proportions)
         self.track_a = 60.0  # semi-major x (doubled for MuJoCo scale)
         self.track_b = 30.0  # semi-minor y
-        self.track_width = 20.0  # Increased to match Pygame proportions (was 8.0)
+        self.track_width = 12.0  # Moderated: wider 12 m lane for tolerance
         
         # Fixed boundary ellipses (like Pygame version - NEVER change)
         self.a_outer = self.track_a + self.track_width / 2.0  # 64.0
@@ -61,8 +66,8 @@ class SimpleCarEnv(gym.Env):
         self.max_lidar_dist = 100.0
         
         # Optimized force scales for realistic racing speeds
-        self.drive_scale = 1400.0  # Increased for better acceleration
-        self.steer_scale = 100.0   # Slightly increased for better control
+        self.drive_scale = 400.0   # Moderated: ≈2.7 m/s² acceleration (150 kg)
+        self.steer_scale = 40.0    # Moderated: milder yaw torque
         self.last_steer = 0.0
         
     def _ellipse_eq(self, x, y, a, b):
@@ -104,24 +109,56 @@ class SimpleCarEnv(gym.Env):
         return min_dist
     
     def _update_waypoint(self):
-        min_dist = float('inf')
         pos_xy = self.data.qpos[0:2]
-        closest_idx = 0
-        for i, (wx, wy) in enumerate(self.waypoints):
-            dist = math.sqrt((pos_xy[0] - wx)**2 + (pos_xy[1] - wy)**2)
-            if dist < min_dist:
-                min_dist = dist
-                closest_idx = i
-        if closest_idx > self.current_waypoint or (closest_idx == 0 and self.current_waypoint > len(self.waypoints) // 2):
-            self.current_waypoint = closest_idx
+        
+        # Store previous waypoint for lap detection
+        prev_waypoint = self.current_waypoint
+        
+        # Check if we're close enough to the NEXT waypoint to advance
+        next_waypoint_idx = (self.current_waypoint + 1) % len(self.waypoints)
+        next_wx, next_wy = self.waypoints[next_waypoint_idx]
+        dist_to_next = math.sqrt((pos_xy[0] - next_wx)**2 + (pos_xy[1] - next_wy)**2)
+        
+        # Advance to next waypoint if we're within threshold distance
+        waypoint_threshold = 15.0  # Distance threshold to advance waypoint
+        if dist_to_next < waypoint_threshold:
+            self.current_waypoint = next_waypoint_idx
+            
+            # Check for lap completion: waypoint wrapped from high to low (e.g., 35 -> 0)
+            if prev_waypoint > len(self.waypoints) // 2 and self.current_waypoint == 0:
+                self._check_lap_completion()
+    
+    def _check_lap_completion(self):
+        """Check if a lap is truly complete using proper conditions"""
+        # 1. Min steps guard: Must have enough steps since last lap
+        steps_since_last_lap = self.steps - self.last_lap_step
+        if steps_since_last_lap < self.min_steps_per_lap:
+            return False
+            
+        # 2. Forward crossing check: Ensure moving in correct direction (clockwise)
+        pos_xy = self.data.qpos[0:2]
+        vel_xy = self.data.qvel[0:2]
+        
+        # Start line normal vector (pointing inward for clockwise motion)
+        # For our track, start line is roughly at x=track_a, y=0
+        # Normal should point toward negative x for clockwise crossing
+        start_line_normal = np.array([-1.0, 0.0])  # Points inward (left) for clockwise
+        
+        # Check if velocity has positive component along normal (crossing in correct direction)
+        forward_crossing = np.dot(vel_xy, start_line_normal) > 0.5  # Require some minimum speed
+        
+        if forward_crossing:
+            self.current_lap += 1
+            self.last_lap_step = self.steps
+            return True
+        
+        return False
     
     def _is_lap_complete(self):
-        pos_xy = self.data.qpos[0:2]
-        if self.current_waypoint >= len(self.waypoints) - 1 and math.sqrt((pos_xy[0] - self.waypoints[0][0])**2 + (pos_xy[1] - self.waypoints[0][1])**2) < 5.0:
-            self.current_lap += 1
-            self.current_waypoint = 0
-            return True
-        return False
+        """Legacy method - now just checks if lap count increased this step"""
+        # This will be called from reward function to detect lap completion
+        # The actual lap logic is now in _check_lap_completion via _update_waypoint
+        return False  # Lap completion is now handled in _update_waypoint
         
     def step(self, action):
         drive, steer = np.clip(action, -1.0, 1.0)
@@ -159,7 +196,7 @@ class SimpleCarEnv(gym.Env):
         # Termination checks
         terminated = self.current_lap >= self.total_laps or self.steps >= self.max_steps or not self._is_on_track(self.data.qpos[0], self.data.qpos[1])
         truncated = False
-        info = {'laps': self.current_lap}
+        info = {'laps': self.current_lap, 'reward_components': getattr(self, '_last_reward_breakdown', {})}
         
         # Clear applied forces for next step
         self.data.xfrc_applied[car_body_id, :] = 0.0
@@ -176,9 +213,8 @@ class SimpleCarEnv(gym.Env):
                                 self.track_b * math.sin(-2 * math.pi * i / 36))
                                for i in range(36)]
         
-        # Perturbed waypoints for environment variety only
-        self.waypoints = [(x + self.np_random.uniform(-3, 3), y + self.np_random.uniform(-3, 3))
-                          for x, y in self.safe_waypoints]
+        # Use fixed safe waypoints to keep the task stationary during training
+        self.waypoints = list(self.safe_waypoints)  # No random perturbation
 
         # Start at first waypoint position (like Pygame version)
         start_waypoint = self.safe_waypoints[0]  # Use safe waypoint for consistent start
@@ -197,6 +233,8 @@ class SimpleCarEnv(gym.Env):
         self.current_lap = 0
         self.current_waypoint = 0
         self.steps = 0
+        self.last_lap_step = 0  # Reset lap tracking
+        self._prev_lap_count = 0  # Reset reward lap tracking
         self.prev_angle = math.atan2(self.data.qpos[1], self.data.qpos[0])
         self.cum_angle = 0.0
         
@@ -308,7 +346,7 @@ class SimpleCarEnv(gym.Env):
         return np.array([pos[0], pos[1], cos_angle, sin_angle, vel] + lidars + [norm_lap, next_curve_angle]).astype(np.float32)
     
     def _get_reward(self, action):
-        """SIMPLIFIED REWARD SYSTEM - Less is more!"""
+        """IMPROVED REWARD SYSTEM - Fixed critical issues"""
         pos_xy = self.data.qpos[0:2]
         car_angle = self.data.qpos[2]
         car_vel = np.linalg.norm(self.data.qvel[0:2])
@@ -321,38 +359,102 @@ class SimpleCarEnv(gym.Env):
         lidars = self._get_obs()[5:10].tolist()
         min_lidar = min(lidars) * self.max_lidar_dist
         
-        # 1. FORWARD PROGRESS REWARD (Primary driver)
-        next_idx = (self.current_waypoint + 1) % len(self.safe_waypoints)
-        dir_to_next = np.array([self.safe_waypoints[next_idx][0] - pos_xy[0], 
-                                self.safe_waypoints[next_idx][1] - pos_xy[1]])
+        # 1. FORWARD PROGRESS REWARD (Primary driver) - FIXED: Use same waypoints as tracking
+        next_idx = (self.current_waypoint + 1) % len(self.waypoints)  # Use perturbed waypoints for consistency
+        dir_to_next = np.array([self.waypoints[next_idx][0] - pos_xy[0], 
+                                self.waypoints[next_idx][1] - pos_xy[1]])
         norm = np.linalg.norm(dir_to_next)
         
         if norm > 0:
             unit_dir = dir_to_next / norm
             vel_vec = np.array([np.cos(car_angle) * car_vel, np.sin(car_angle) * car_vel])
             progress = np.dot(vel_vec, unit_dir)
-            progress_reward = 5.0 * progress  # Strong forward movement reward
+            # Scaled progress reward to fall within [-1,1]
+            progress_reward = np.tanh(progress / 10.0)
         else:
             progress_reward = 0.0
         
-        # 2. CENTERLINE PENALTY (Keep car in middle)
+        # 2. SPEED INCENTIVE (Encourage faster, more confident driving)
+        optimal_speed = 8.0  # Target speed for racing
+        speed_reward = 0.5 * min(car_vel / optimal_speed, 1.0)  # Reward up to optimal speed
+        
+        # 3. CENTERLINE PENALTY (Keep car in middle) - Reduced impact
         dist_to_center = self._dist_to_centerline()
-        centerline_penalty = -0.2 * dist_to_center  # Penalty for deviating from center
+        centerline_penalty = -0.1 * dist_to_center  # Reduced penalty for more freedom
         
-        # 3. WALL SAFETY PENALTY (Based on lidar) - Adjusted threshold
+        # 4. WALL SAFETY PENALTY (Based on lidar) - FIXED: Scale-appropriate
         safety_penalty = 0.0
-        if min_lidar < 4.0:  # Too close to walls (lowered from 6.0 to match reality)
-            safety_penalty = -10.0 * (4.0 - min_lidar)  # Strong penalty for danger
+        safety_threshold = 1.0  # Scale-appropriate threshold (1m for 60x30 track)
+        if min_lidar < safety_threshold:
+            # Gentler penalty that doesn't overwhelm other rewards
+            safety_penalty = -1.0 * (safety_threshold - min_lidar)  # Further reduced
         
-        # 4. LAP COMPLETION BONUS
+        # 5. LAP COMPLETION BONUS REMOVED for initial training stability
         lap_bonus = 0.0
-        if self._is_lap_complete():
-            lap_bonus = 1000.0  # Big reward for completing laps
         
-        # TOTAL REWARD (Simple sum)
-        reward = progress_reward + centerline_penalty + safety_penalty + lap_bonus
+        # 6. CURVE-AWARE SPEED PENALTY (Like pygame version)
+        curve_penalty = 0.0
+        if self.current_waypoint + 1 < len(self.waypoints):
+            next_idx = (self.current_waypoint + 1) % len(self.waypoints)
+            next_next_idx = (next_idx + 1) % len(self.waypoints)
+            vec1 = np.array(self.waypoints[next_idx]) - np.array(self.waypoints[self.current_waypoint])
+            vec2 = np.array(self.waypoints[next_next_idx]) - np.array(self.waypoints[next_idx])
+            norm1, norm2 = np.linalg.norm(vec1), np.linalg.norm(vec2)
+            if norm1 > 0 and norm2 > 0:
+                cos_angle = np.clip(np.dot(vec1, vec2) / (norm1 * norm2), -1.0, 1.0)
+                angle = np.arccos(cos_angle)
+                if angle > np.radians(45):  # Curve detected
+                    max_curve_speed = 2.0  # Scale-appropriate max speed in curves (vs 10.0 in pygame)
+                    if car_vel > max_curve_speed:
+                        curve_penalty = -0.2 * (car_vel - max_curve_speed)
+
+        # 7. ANTICIPATION PENALTY (Look ahead for curves)
+        anticipation_penalty = 0.0
+        if self.current_waypoint + 2 < len(self.waypoints):
+            next_idx = (self.current_waypoint + 1) % len(self.waypoints)
+            next_next_idx = (next_idx + 1) % len(self.waypoints)
+            vec1 = np.array(self.waypoints[next_idx]) - np.array(self.waypoints[self.current_waypoint])
+            vec2 = np.array(self.waypoints[next_next_idx]) - np.array(self.waypoints[next_idx])
+            norm1, norm2 = np.linalg.norm(vec1), np.linalg.norm(vec2)
+            if norm1 > 0 and norm2 > 0:
+                cos_angle = np.clip(np.dot(vec1, vec2) / (norm1 * norm2), -1.0, 1.0)
+                angle = np.arccos(cos_angle)
+                if angle > np.radians(45):  # Approaching curve
+                    max_approach_speed = 1.6  # Scale-appropriate approach speed (vs 8.0 in pygame)
+                    if car_vel > max_approach_speed:
+                        anticipation_penalty = -0.1 * (car_vel - max_approach_speed)
+
+        # 8. DIRECTIONAL PENALTY (Force clockwise motion)
+        # Penalize movement in wrong direction (counter-clockwise)
+        directional_penalty = 0.0
+        if car_vel > 0.1:  # Only when car is moving
+            # Calculate if car is moving clockwise or counter-clockwise around track center
+            # Vector from track center to car
+            center_to_car = np.array([pos_xy[0], pos_xy[1]])  # Track center at (0,0)
+            # Car velocity vector
+            velocity_vec = np.array([np.cos(car_angle) * car_vel, np.sin(car_angle) * car_vel])
+            # Cross product gives direction of rotation (positive = counter-clockwise, negative = clockwise)
+            cross_product = center_to_car[0] * velocity_vec[1] - center_to_car[1] * velocity_vec[0]
+            
+            if cross_product > 0:  # Counter-clockwise motion
+                directional_penalty = -5.0 * abs(cross_product) / (np.linalg.norm(center_to_car) * car_vel)
         
-        return float(reward)
+        # Combine and clip final reward to roughly [-1,1]
+        reward = progress_reward + speed_reward + centerline_penalty + safety_penalty + curve_penalty + anticipation_penalty + directional_penalty
+        reward = float(np.clip(reward, -1.0, 1.0))
+
+        # Store breakdown for debugging
+        self._last_reward_breakdown = {
+            'progress': float(progress_reward),
+            'speed': float(speed_reward),
+            'centerline': float(centerline_penalty),
+            'safety': float(safety_penalty),
+            'curve': float(curve_penalty),
+            'anticipation': float(anticipation_penalty),
+            'directional': float(directional_penalty)
+        }
+        
+        return reward
     
     def render(self):
         if self.render_mode == 'human':

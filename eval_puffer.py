@@ -8,15 +8,23 @@ import glob
 import re
 
 def main():
+    # Create environment for evaluation (single env, with rendering)
     env = SimpleCarEnv(render_mode='rgb_array', eval_mode=True)
-    # Find latest run folder
+    
+    # Find latest run folder (matching eval.py conventions)
     run_dirs = sorted(glob.glob("runs/run_*"), key=lambda x: int(re.search(r'run_(\d+)', x).group(1)))
     if not run_dirs:
-        raise ValueError("No run folders found in runs/")
+        print("No run folders found in runs/. Please train first with train_puffer.py")
+        return
     latest_run = run_dirs[-1]
     run_num = int(re.search(r'run_(\d+)', latest_run).group(1))
-    latest_model = f"{latest_run}/ppo_car.zip"
-    model = PPO.load(latest_model)
+    model_path = f"{latest_run}/ppo_car.zip"
+    
+    if not os.path.exists(model_path):
+        print(f"Model {model_path} not found. Please train first.")
+        return
+    
+    model = PPO.load(model_path)
     
     obs, info = env.reset()
     done = False
@@ -47,7 +55,7 @@ def main():
         if done:
             print(f"Episode terminated after {step} steps. Final laps: {info['laps']}")
     
-    # Save video in run folder with sub-numbering
+    # Save video in run folder with sub-numbering (matching eval.py conventions)
     sub_num = 1
     video_path = f'{latest_run}/eval_{sub_num}.mp4'
     while os.path.exists(video_path):
