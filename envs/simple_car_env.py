@@ -16,8 +16,8 @@ class SimpleCarEnv(gym.Env):
         self.model = mujoco.MjModel.from_xml_path(model_path)
         self.data = mujoco.MjData(self.model)
         
-        # Action: [drive_force, steer]. Allow slight braking up to -2 units
-        self.action_space = spaces.Box(low=np.array([-2.0, -1.0]), high=np.array([1.0, 1.0]), dtype=np.float32)
+        # Action: [drive_force, steer]. Disallow reverse; throttle in [0,1]
+        self.action_space = spaces.Box(low=np.array([0.0, -1.0]), high=np.array([1.0, 1.0]), dtype=np.float32)
         
         # Observation: [norm_pos_x, norm_pos_y, cos_angle, sin_angle, norm_vel, norm_lidars*5, norm_lap, next_curve_angle]
         low = np.array([-1.0, -1.0, -1.0, -1.0, 0.0] + [0.0] * 5 + [0.0, 0.0])
@@ -67,7 +67,7 @@ class SimpleCarEnv(gym.Env):
         
         # Optimized force scales for realistic racing speeds
         self.drive_scale = 400.0   # Moderated: ≈2.7 m/s² acceleration (150 kg)
-        self.steer_scale = 80.0    # Increased: stronger yaw torque for curves
+        self.steer_scale = 120.0   # Restore stronger steering torque
         self.last_steer = 0.0
         
     def _ellipse_eq(self, x, y, a, b):
@@ -162,6 +162,8 @@ class SimpleCarEnv(gym.Env):
         
     def step(self, action):
         drive, steer = np.clip(action, -1.0, 1.0)
+        # Clip drive to [0,1] to avoid reverse motion
+        drive = np.clip(drive, 0.0, 1.0)
         car_body_id = self.model.body('car').id
         
         # Apply physics-optimized forces with velocity damping
@@ -317,8 +319,8 @@ class SimpleCarEnv(gym.Env):
             ray_dists.append(capped)
 
         # --- NEW: lidar-based curve indicator (left rays minus right rays) ---
-        curve_ind = (lidars[0] + lidars[1]) - (lidars[3] + lidars[4])  # range approximately [-2, 2]
-        curve_ind_norm = float(np.clip(curve_ind, -1.0, 1.0))
+        curve_ind = (lidars[0] + lidars[1]) - (lidars[3] + lidars[4])  # raw range approx [-2, 2]
+        curve_ind_raw = float(-curve_ind / 2.0)  # flip sign so positive means turn right, scale to [-1,1]
         
         # Update lidar tip site positions (local frame)
         car_pos_3d = self.data.qpos[0:3].copy()  # Use 3D position for visualization
@@ -348,7 +350,7 @@ class SimpleCarEnv(gym.Env):
             next_curve_angle = np.arccos(np.clip(np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2) + 1e-8), -1.0, 1.0)) / np.pi  # [0,1]
         
         # Replace next_curve_angle in observation with sensor-derived curve indicator
-        return np.array([pos[0], pos[1], cos_angle, sin_angle, vel] + lidars + [norm_lap, curve_ind_norm]).astype(np.float32)
+        return np.array([pos[0], pos[1], cos_angle, sin_angle, vel] + lidars + [norm_lap, curve_ind_raw]).astype(np.float32)
     
     def _get_reward(self, action):
         """IMPROVED REWARD SYSTEM - Fixed critical issues"""
@@ -365,33 +367,38 @@ class SimpleCarEnv(gym.Env):
         lidars = self._get_obs()[5:10].tolist()
         # Curve indicator from lidar (same formula as in _get_obs)
         curve_ind = (lidars[0] + lidars[1]) - (lidars[3] + lidars[4])
+        curve_ind = -curve_ind / 2.0  # sign flipped, scaled
         min_lidar = min(lidars) * self.max_lidar_dist
         
         # 1. FORWARD PROGRESS REWARD (Primary driver) - FIXED: Use same waypoints as tracking
-        next_idx = (self.current_waypoint + 1) % len(self.waypoints)  # Use perturbed waypoints for consistency
-        dir_to_next = np.array([self.waypoints[next_idx][0] - pos_xy[0], 
-                                self.waypoints[next_idx][1] - pos_xy[1]])
-        norm = np.linalg.norm(dir_to_next)
-        
-        if norm > 0:
-            unit_dir = dir_to_next / norm
+        next_idx = (self.current_waypoint + 1) % len(self.waypoints)
+        # Tangent vector along track centre-line (current waypoint -> next waypoint)
+        tangent = np.array(self.waypoints[next_idx]) - np.array(self.waypoints[self.current_waypoint])
+        tan_norm = np.linalg.norm(tangent)
+        if tan_norm > 0:
+            unit_tan = tangent / tan_norm
             vel_vec = np.array([np.cos(car_angle) * car_vel, np.sin(car_angle) * car_vel])
-            progress = np.dot(vel_vec, unit_dir)
-            # Scaled progress reward to fall within [-1,1]
+            progress = np.dot(vel_vec, unit_tan)  # Positive when moving along track direction
             progress_reward = np.tanh(progress / 10.0)
         else:
             progress_reward = 0.0
         
         # 2. SPEED INCENTIVE AND CURVE-AWARE PENALTY --- simplified
         # --- Simplified reward terms ---
-        # Positive speed incentive (always encourages some movement)
-        speed_reward = 0.3 * np.tanh(car_vel / 4.0)
+        # Positive speed incentive with idle penalty
+        if car_vel < 1.0:
+            speed_reward = -0.2  # discourage crawling
+        else:
+            speed_reward = 1.5 * np.tanh(car_vel / 2.0)  # encourage up to ~6 m/s
 
         # Curve-aware target speed and penalty (only if already moving fast)
-        curve_target_speed = 10.0 - 6.0 * abs(curve_ind)  # 10 m/s straight, 4 m/s tight curve
-        speed_excess = max(0.0, car_vel - curve_target_speed)
-        curve_speed_penalty = -0.3 * speed_excess
+        curve_speed_penalty = 0.0
+        if car_vel > 2.0:
+            curve_target_speed = 10.0 - 6.0 * abs(curve_ind)
+            speed_excess = max(0.0, car_vel - curve_target_speed)
+            curve_speed_penalty = -0.3 * speed_excess
 
+        # 2b. STEERING ALIGNMENT REWARD - encourage steering in curve direction
         # Wall safety penalty (only if within 3 m of wall)
         safety_penalty = 0.0
         safety_threshold = 3.0
