@@ -36,7 +36,7 @@ class SimpleCarEnv(gym.Env):
         # Track parameters (oval center at 0,0, scaled to match car-RL proportions)
         self.track_a = 60.0  # semi-major x (doubled for MuJoCo scale)
         self.track_b = 30.0  # semi-minor y
-        self.track_width = 8.0  # Adjusted for car size
+        self.track_width = 20.0  # Increased to match Pygame proportions (was 8.0)
         
         # Fixed boundary ellipses (like Pygame version - NEVER change)
         self.a_outer = self.track_a + self.track_width / 2.0  # 64.0
@@ -46,12 +46,14 @@ class SimpleCarEnv(gym.Env):
         
         # Generate waypoints on centerline (CLOCKWISE direction)
         self.waypoints = []
+        self.safe_waypoints = []  # CRITICAL FIX: Safe waypoints for progress calculation
         num_points = 36  # every 10 degrees
         for i in range(num_points):
             theta = -2 * math.pi * i / num_points  # NEGATIVE for clockwise
             x = self.track_a * math.cos(theta)
             y = self.track_b * math.sin(theta)
             self.waypoints.append((x, y))
+            self.safe_waypoints.append((x, y))  # Keep unperturbed for safety
         
         self.current_waypoint = 0
         self.max_vel = 20.0
@@ -168,22 +170,23 @@ class SimpleCarEnv(gym.Env):
         super().reset(seed=seed)
         mujoco.mj_resetData(self.model, self.data)
         
-        # Perturb waypoints for variety (CLOCKWISE direction)
-        original_waypoints = [(self.track_a * math.cos(-2 * math.pi * i / 36),
-                               self.track_b * math.sin(-2 * math.pi * i / 36))
-                              for i in range(36)]
-
-        # Keep variety for the path but spawn exactly on the centre-line
+        # CRITICAL FIX: Separate safe and variety waypoints
+        # Safe waypoints for progress calculation (never perturbed)
+        self.safe_waypoints = [(self.track_a * math.cos(-2 * math.pi * i / 36),
+                                self.track_b * math.sin(-2 * math.pi * i / 36))
+                               for i in range(36)]
+        
+        # Perturbed waypoints for environment variety only
         self.waypoints = [(x + self.np_random.uniform(-3, 3), y + self.np_random.uniform(-3, 3))
-                          for x, y in original_waypoints]
+                          for x, y in self.safe_waypoints]
 
         # Start at first waypoint position (like Pygame version)
-        start_waypoint = original_waypoints[0]  # Use unperturbed waypoint for consistent start
+        start_waypoint = self.safe_waypoints[0]  # Use safe waypoint for consistent start
         self.data.qpos[0] = start_waypoint[0]
         self.data.qpos[1] = start_waypoint[1]
         
         # Set initial orientation to point toward next waypoint (like Pygame version)
-        next_waypoint = original_waypoints[1]
+        next_waypoint = self.safe_waypoints[1]
         dx = next_waypoint[0] - start_waypoint[0]
         dy = next_waypoint[1] - start_waypoint[1]
         initial_yaw = math.atan2(dy, dx)
@@ -305,97 +308,49 @@ class SimpleCarEnv(gym.Env):
         return np.array([pos[0], pos[1], cos_angle, sin_angle, vel] + lidars + [norm_lap, next_curve_angle]).astype(np.float32)
     
     def _get_reward(self, action):
+        """SIMPLIFIED REWARD SYSTEM - Less is more!"""
         pos_xy = self.data.qpos[0:2]
-        car_angle = self.data.qpos[2]  # yaw only
+        car_angle = self.data.qpos[2]
         car_vel = np.linalg.norm(self.data.qvel[0:2])
-        drive, steer = np.clip(action, -1.0, 1.0)  # Assuming action available; if not, pass from step
         
-        reward = 0.0
-        
+        # Off-track termination
         if not self._is_on_track(pos_xy[0], pos_xy[1]):
-            reward = -100.0
-        else:
-            dist_to_center = self._dist_to_centerline()
-            next_idx = (self.current_waypoint + 1) % len(self.waypoints)
-            dir_to_next = np.array([self.waypoints[next_idx][0] - pos_xy[0], self.waypoints[next_idx][1] - pos_xy[1]])
-            norm = np.linalg.norm(dir_to_next)
-            if norm > 0:
-                unit_dir = dir_to_next / norm
-                vel_vec = np.array([np.cos(car_angle) * car_vel, np.sin(car_angle) * car_vel])
-                progress = np.dot(vel_vec, unit_dir)
-                velocity_bonus = (car_vel / self.max_vel) * 2.0  # Increased from 0.5 to 2.0
-                stillness_penalty = -0.5 * (1 - car_vel / self.min_vel_threshold) if car_vel < self.min_vel_threshold else 0.0
-                action_penalty = -0.01 * (abs(steer) + abs(drive))
-                
-                # Boundary proximity penalty (using lidars from obs or recompute)
-                lidars = self._get_obs()[5:10].tolist()  # Extract from obs
-                min_lidar = min(lidars) * self.max_lidar_dist  # Unnormalize
-                # Enhanced boundary penalty for crash prevention
-                boundary_penalty = 0.0
-                if min_lidar < 15.0:  # Increased safe distance
-                    boundary_penalty = -1.0 * (15.0 - min_lidar)  # Stronger penalty
-                if min_lidar < 5.0:  # Very close to walls
-                    boundary_penalty = -5.0 * (5.0 - min_lidar)  # Much stronger penalty
-                
-                # Curve-aware speed penalty
-                curve_penalty = 0.0
-                if self.current_waypoint + 1 < len(self.waypoints):
-                    next_idx = (self.current_waypoint + 1) % len(self.waypoints)
-                    next_next_idx = (next_idx + 1) % len(self.waypoints)
-                    vec1 = np.array(self.waypoints[next_idx]) - np.array(self.waypoints[self.current_waypoint])
-                    vec2 = np.array(self.waypoints[next_next_idx]) - np.array(self.waypoints[next_idx])
-                    angle = np.arccos(np.clip(np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2) + 1e-8), -1.0, 1.0))
-                    if angle > np.radians(45) and car_vel > 10.0:
-                        curve_penalty = -0.2 * (car_vel - 10.0)
-                
-                # Anticipation penalty
-                anticipation_penalty = 0.0
-                if self.current_waypoint + 2 < len(self.waypoints):
-                    next_idx = (self.current_waypoint + 1) % len(self.waypoints)
-                    next_next_idx = (next_idx + 1) % len(self.waypoints)
-                    vec1 = np.array(self.waypoints[next_idx]) - np.array(self.waypoints[self.current_waypoint])
-                    vec2 = np.array(self.waypoints[next_next_idx]) - np.array(self.waypoints[next_idx])
-                    angle = np.arccos(np.clip(np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2) + 1e-8), -1.0, 1.0))
-                    if angle > np.radians(45) and car_vel > 8.0:
-                        anticipation_penalty = -0.1 * (car_vel - 8.0)
-                
-                # Enhanced lidar-based navigation rewards
-                avg_lidar = np.mean(lidars) * self.max_lidar_dist
-                min_lidar = min(lidars) * self.max_lidar_dist
-                
-                # 1. Optimal distance maintenance (stronger reward)
-                optimal_min = 15.0
-                optimal_max = 30.0
-                distance_penalty = 0.0
-                if avg_lidar < optimal_min:
-                    distance_penalty = -0.2 * (optimal_min - avg_lidar)  # Increased penalty
-                elif avg_lidar > optimal_max:
-                    distance_penalty = -0.2 * (avg_lidar - optimal_max)
-                
-                # 2. Lidar-guided steering reward (NEW)
-                lidar_steering_reward = 0.0
-                left_lidar = (lidars[0] + lidars[1]) * self.max_lidar_dist / 2  # Average of left sensors
-                right_lidar = (lidars[3] + lidars[4]) * self.max_lidar_dist / 2  # Average of right sensors
-                
-                # Reward steering toward more open space
-                if abs(left_lidar - right_lidar) > 5.0:  # Significant difference
-                    if left_lidar > right_lidar and steer > 0:  # More space left, steering left
-                        lidar_steering_reward = 0.5
-                    elif right_lidar > left_lidar and steer < 0:  # More space right, steering right  
-                        lidar_steering_reward = 0.5
-                
-                # 3. Speed bonus based on available space (NEW)
-                forward_lidar = lidars[2] * self.max_lidar_dist  # Center sensor
-                space_speed_bonus = 0.0
-                if forward_lidar > 20.0:  # Lots of space ahead
-                    space_speed_bonus = min(car_vel / 10.0, 1.0)  # Reward higher speeds
-                
-                reward = (2.0 * progress) - 0.5 * dist_to_center + velocity_bonus + stillness_penalty + action_penalty + boundary_penalty + curve_penalty + anticipation_penalty + distance_penalty + lidar_steering_reward + space_speed_bonus + 1.0
-            else:
-                reward = -1.0
+            return -100.0
         
+        # Get lidar readings for safety
+        lidars = self._get_obs()[5:10].tolist()
+        min_lidar = min(lidars) * self.max_lidar_dist
+        
+        # 1. FORWARD PROGRESS REWARD (Primary driver)
+        next_idx = (self.current_waypoint + 1) % len(self.safe_waypoints)
+        dir_to_next = np.array([self.safe_waypoints[next_idx][0] - pos_xy[0], 
+                                self.safe_waypoints[next_idx][1] - pos_xy[1]])
+        norm = np.linalg.norm(dir_to_next)
+        
+        if norm > 0:
+            unit_dir = dir_to_next / norm
+            vel_vec = np.array([np.cos(car_angle) * car_vel, np.sin(car_angle) * car_vel])
+            progress = np.dot(vel_vec, unit_dir)
+            progress_reward = 5.0 * progress  # Strong forward movement reward
+        else:
+            progress_reward = 0.0
+        
+        # 2. CENTERLINE PENALTY (Keep car in middle)
+        dist_to_center = self._dist_to_centerline()
+        centerline_penalty = -0.2 * dist_to_center  # Penalty for deviating from center
+        
+        # 3. WALL SAFETY PENALTY (Based on lidar) - Adjusted threshold
+        safety_penalty = 0.0
+        if min_lidar < 4.0:  # Too close to walls (lowered from 6.0 to match reality)
+            safety_penalty = -10.0 * (4.0 - min_lidar)  # Strong penalty for danger
+        
+        # 4. LAP COMPLETION BONUS
+        lap_bonus = 0.0
         if self._is_lap_complete():
-            reward += 300.0 / (self.steps + 1)
+            lap_bonus = 1000.0  # Big reward for completing laps
+        
+        # TOTAL REWARD (Simple sum)
+        reward = progress_reward + centerline_penalty + safety_penalty + lap_bonus
         
         return float(reward)
     
