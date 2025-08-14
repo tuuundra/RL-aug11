@@ -11,7 +11,7 @@ import os
 import glob
 import re
 
-def debug_car_journey(model_path: str = None, max_steps: int = 2000):
+def debug_car_journey(model_path: str = None, max_steps: int = 10000):
     """Track and visualize the car's complete journey"""
     
     # Load latest model if not specified
@@ -46,7 +46,8 @@ def debug_car_journey(model_path: str = None, max_steps: int = 2000):
     print(f"Starting position: ({obs[0]:.2f}, {obs[1]:.2f})")
     print()
     
-    for step in range(max_steps):
+    step = 0
+    while step < max_steps:
         # Get action
         action, _ = model.predict(obs, deterministic=True)
         
@@ -75,10 +76,8 @@ def debug_car_journey(model_path: str = None, max_steps: int = 2000):
             print()
         
         if done:
-            print(f"Episode ended at step {step}")
-            print(f"Final reward: {sum(rewards):.2f}")
-            print(f"Laps completed: {lap_progress[-1]}")
             break
+        step += 1
     
     # Convert to numpy arrays
     positions = np.array(positions)
