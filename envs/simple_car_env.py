@@ -385,28 +385,28 @@ class SimpleCarEnv(gym.Env):
         
         # 2. SPEED INCENTIVE AND CURVE-AWARE PENALTY --- simplified
         # --- Simplified reward terms ---
-        # Positive speed incentive with idle penalty
+        # Positive speed incentive with idle penalty (reduced cap)
         if car_vel < 1.0:
-            speed_reward = -0.2  # discourage crawling
+            speed_reward = -0.2
         else:
-            speed_reward = 1.5 * np.tanh(car_vel / 2.0)  # encourage up to ~6 m/s
+            speed_reward = 1.0 * np.tanh(car_vel / 2.0)
 
         # Curve-aware target speed and penalty (only if already moving fast)
         curve_speed_penalty = 0.0
         if car_vel > 2.0:
             curve_target_speed = 10.0 - 6.0 * abs(curve_ind)
             speed_excess = max(0.0, car_vel - curve_target_speed)
-            curve_speed_penalty = -0.3 * speed_excess
+            curve_speed_penalty = -0.1 * speed_excess    # softened
 
         # 2b. LATERAL BALANCE REWARD - always positive, highest when centred
-        balance_reward = 0.4 * (1.0 - min(1.0, abs(curve_ind)))  # curve_ind in [-1,1]
+        balance_reward = 0.4 * (1.0 - min(1.0, abs(curve_ind)))  # unchanged
 
-        # 2c. Continuous safety penalty based on gap to nearest wall
-        car_half_width = 1.0   # 2 m wide box geom
-        lane_half_width = 6.0  # 12 m total lane
-        gap = max(min_lidar - car_half_width, 0.0)          # free space from car side to wall
-        s = np.clip(gap / (lane_half_width - car_half_width), 0.0, 1.0)  # 1 when centred, 0 when touching
-        safety_penalty = - (1.0 - s) ** 2   # 0 at centre, -1 at wall
+        # 2c. Continuous safety penalty (boosted base)
+        car_half_width = 1.0
+        lane_half_width = 6.0
+        gap = max(min_lidar - car_half_width, 0.0)
+        s = np.clip(gap / (lane_half_width - car_half_width), 0.0, 1.0)
+        safety_penalty = -1.5 * (1.0 - s) ** 2      # stronger negative pull
 
         # Combine and clip final reward (keep total in [-1,1])
         reward = progress_reward + speed_reward + curve_speed_penalty + balance_reward + safety_penalty
