@@ -406,10 +406,15 @@ class SimpleCarEnv(gym.Env):
         lane_half_width = 6.0
         gap = max(min_lidar - car_half_width, 0.0)
         s = np.clip(gap / (lane_half_width - car_half_width), 0.0, 1.0)
+        # Steer-away bonus: small positive if steering away from nearer wall when close
+        wall_side = np.sign(curve_ind)  # +1 if right wall closer (steer left, negative), -1 if left (steer right, positive)
+        is_steering_away = np.sign(steer) == -wall_side  # opposite sign to wall_side
+        steer_bonus = 0.1 * (1.0 - s) if is_steering_away and gap < 4.0 else 0.0
+
         safety_penalty = -1.5 * (1.0 - s) ** 2      # stronger negative pull
 
         # Combine and clip final reward (keep total in [-1,1])
-        reward = progress_reward + speed_reward + curve_speed_penalty + balance_reward + safety_penalty
+        reward = progress_reward + speed_reward + curve_speed_penalty + balance_reward + steer_bonus + safety_penalty
         reward = float(np.clip(reward, -1.0, 1.0))
         # Store breakdown for debugging
         self._last_reward_breakdown = {
@@ -417,6 +422,7 @@ class SimpleCarEnv(gym.Env):
             'speed': float(speed_reward),
             'curve_penalty': float(curve_speed_penalty),
             'balance': float(balance_reward),
+            'steer_bonus': float(steer_bonus),
             'safety': float(safety_penalty)
         }
         
