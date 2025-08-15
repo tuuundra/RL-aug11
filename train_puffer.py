@@ -3,6 +3,7 @@ from stable_baselines3.common.vec_env import SubprocVecEnv
 from envs.simple_car_env import SimpleCarEnv
 import os
 import re
+from stable_baselines3.common.env_util import make_vec_env
 
 # Create PufferLib environment wrapper
 def make_env():
@@ -12,7 +13,7 @@ def make_env():
 def main():
     # Configuration
     num_envs = 8  # Number of parallel environments
-    total_timesteps = 100_000  # Quick test after fixes
+    total_timesteps = 300_000  # extended training
     
     print(f"Creating {num_envs} parallel environments...")
     
@@ -34,7 +35,7 @@ def main():
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.001
+        ent_coef=0.02,
         # Removed tensorboard_log to avoid dependency issues
     )
     

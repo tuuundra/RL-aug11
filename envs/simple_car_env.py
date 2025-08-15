@@ -32,7 +32,6 @@ class SimpleCarEnv(gym.Env):
         self.prev_angle = 0.0
         self.cum_angle = 0.0
         self.steps = 0
-        self.max_steps = 5000
         
         # Lap completion tracking
         self.last_lap_step = 0  # Step count when last lap was completed
@@ -196,7 +195,7 @@ class SimpleCarEnv(gym.Env):
         reward = self._get_reward(action)
         
         # Termination checks
-        terminated = self.current_lap >= self.total_laps or self.steps >= self.max_steps or not self._is_on_track(self.data.qpos[0], self.data.qpos[1])
+        terminated = self.current_lap >= self.total_laps or not self._is_on_track(self.data.qpos[0], self.data.qpos[1])
         truncated = False
         info = {'laps': self.current_lap, 'reward_components': getattr(self, '_last_reward_breakdown', {})}
         
@@ -298,7 +297,7 @@ class SimpleCarEnv(gym.Env):
         
         # Custom lidar using ellipse boundary math (like Pygame version)
         lidars = []
-        ray_angles = np.deg2rad([-60, -30, 0, 30, 60])
+        ray_angles = np.deg2rad([-80, -40, 0, 40, 80])
         ray_dirs = []
         ray_dists = []
         car_pos = self.data.qpos[0:2]  # Only x,y needed
@@ -380,49 +379,61 @@ class SimpleCarEnv(gym.Env):
             unit_tan = tangent / tan_norm
             vel_vec = np.array([np.cos(car_angle) * car_vel, np.sin(car_angle) * car_vel])
             progress = np.dot(vel_vec, unit_tan)  # Positive when moving along track direction
-            progress_reward = np.clip(progress / 5.0, -1.0, 2.0)  # Allow higher rewards for progress
+            progress_reward = np.tanh(progress / 10.0)  # smoother scaling in [-1,1]
+            heading_alignment = np.dot(unit_tan, np.array([np.cos(car_angle), np.sin(car_angle)]))
+            heading_reward = 0.5 * heading_alignment  # +0.5 when perfectly aligned, -0.5 opposite
+            # Scale key movement rewards
+            progress_reward *= 3.0
+            heading_reward *= 3.0
         else:
             progress_reward = 0.0
         
         # 2. SPEED INCENTIVE - Encourage movement over stillness
-        if car_vel < 0.5:
-            speed_reward = -0.1  # Small penalty for being too slow
+        if car_vel < 0.2:
+            speed_reward = -0.5  # milder idle penalty when nearly stopped
         else:
-            speed_reward = 0.5 * np.tanh(car_vel / 3.0)  # Moderate speed bonus
+            speed_reward = 0.2 + 2.0 * np.tanh(car_vel / 2.0)  # baseline + cap
 
-        # Curve-aware target speed and penalty (only if already moving fast)
-        curve_speed_penalty = 0.0
-        if car_vel > 3.0:
-            curve_target_speed = 8.0 - 4.0 * abs(curve_ind)
-            speed_excess = max(0.0, car_vel - curve_target_speed)
-            curve_speed_penalty = -0.05 * speed_excess    # Very mild penalty
+        # New: Movement bonus to encourage any motion
+        movement_bonus = 1.0 * min(car_vel / 1.0, 1.0) if car_vel > 0.1 else 0.0
 
-        # 2b. LATERAL BALANCE REWARD - Reduce to avoid conflict with progress
-        balance_reward = 0.1 * (1.0 - min(1.0, abs(curve_ind)))
+        # Curve-aware target speed and penalty (revised: always active, scaled by speed)
+        curve_speed_penalty = -0.4 * car_vel * abs(curve_ind)  # proportional to speed and curve severity
 
-        # 2c. Continuous safety penalty - Much weaker so it doesn't dominate
+        # 2b. LATERAL BALANCE REWARD - higher weight to keep centred
+        balance_reward = 0.4 * (1.0 - min(1.0, abs(curve_ind)))
+
+        # 2c. CENTER-LINE REWARD (new): encourage staying near middle of lane
+        dist_c = self._dist_to_centerline()
+        center_reward = 0.5 * (1.0 - np.tanh(dist_c / 4.0))  # ~+0.5 at centre, ~0 at edge
+
+        # 2d. Continuous safety penalty - reduced weight to avoid double-counting
         car_half_width = 1.0
         lane_half_width = 6.0
         gap = max(min_lidar - car_half_width, 0.0)
-        s = np.clip(gap / (lane_half_width - car_half_width), 0.0, 1.0)
-        # Steer-away bonus: small positive if steering away from nearer wall when close
-        wall_side = np.sign(curve_ind)  # +1 if right wall closer (steer left, negative), -1 if left (steer right, positive)
-        is_steering_away = np.sign(steer) == -wall_side  # opposite sign to wall_side
-        steer_bonus = 0.05 * (1.0 - s) if is_steering_away and gap < 4.0 else 0.0
+        if gap > 3.0:
+            safety_penalty = 0.0
+        else:
+            safety_penalty = -0.5 * (1.0 - gap / 3.0)  # half strength
 
-        safety_penalty = -0.5 * (1.0 - s) ** 2      # Much weaker penalty
+        # 2e. Steering effort penalties
+        steer_penalty = -0.2 * abs(steer)
+        speed_steer_penalty = -0.05 * car_vel * abs(steer)
 
-        # Combine and clip final reward (allow higher rewards for good progress)
-        reward = progress_reward + speed_reward + curve_speed_penalty + balance_reward + steer_bonus + safety_penalty
-        reward = float(np.clip(reward, -2.0, 3.0))
+        # Combine and clip final reward
+        reward = (progress_reward + heading_reward + center_reward + speed_reward + movement_bonus +
+                  curve_speed_penalty + balance_reward + safety_penalty + steer_penalty + speed_steer_penalty)
+        reward = float(np.clip(reward, -1.0, 1.0))
         # Store breakdown for debugging
         self._last_reward_breakdown = {
             'progress': float(progress_reward),
-            'speed': float(speed_reward),
-            'curve_penalty': float(curve_speed_penalty),
+            'heading': float(heading_reward),
+            'center': float(center_reward),
+            'speed': float(speed_reward + movement_bonus),
+            'curve_pen': float(curve_speed_penalty),
             'balance': float(balance_reward),
-            'steer_bonus': float(steer_bonus),
-            'safety': float(safety_penalty)
+            'safety': float(safety_penalty),
+            'steer_pen': float(steer_penalty + speed_steer_penalty)
         }
         
         return reward
