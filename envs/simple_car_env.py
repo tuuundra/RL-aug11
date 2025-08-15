@@ -401,11 +401,12 @@ class SimpleCarEnv(gym.Env):
         # 2b. LATERAL BALANCE REWARD - always positive, highest when centred
         balance_reward = 0.4 * (1.0 - min(1.0, abs(curve_ind)))  # curve_ind in [-1,1]
 
-        # 2c. Wall safety penalty (only if within 3 m of wall)
-        safety_penalty = 0.0
-        safety_threshold = 3.0
-        if min_lidar < safety_threshold:
-            safety_penalty = -2.0 * (safety_threshold - min_lidar)
+        # 2c. Continuous safety penalty based on gap to nearest wall
+        car_half_width = 1.0   # 2 m wide box geom
+        lane_half_width = 6.0  # 12 m total lane
+        gap = max(min_lidar - car_half_width, 0.0)          # free space from car side to wall
+        s = np.clip(gap / (lane_half_width - car_half_width), 0.0, 1.0)  # 1 when centred, 0 when touching
+        safety_penalty = - (1.0 - s) ** 2   # 0 at centre, -1 at wall
 
         # Combine and clip final reward (keep total in [-1,1])
         reward = progress_reward + speed_reward + curve_speed_penalty + balance_reward + safety_penalty
