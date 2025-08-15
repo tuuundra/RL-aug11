@@ -63,7 +63,7 @@ class SimpleCarEnv(gym.Env):
         self.current_waypoint = 0
         self.max_vel = 20.0
         self.min_vel_threshold = 1.0
-        self.max_lidar_dist = 100.0
+        self.max_lidar_dist = 40.0   # better scaling: outer wall ~34 m
         
         # Optimized force scales for realistic racing speeds
         self.drive_scale = 400.0   # Moderated: ≈2.7 m/s² acceleration (150 kg)
