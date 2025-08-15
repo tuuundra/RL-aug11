@@ -398,21 +398,24 @@ class SimpleCarEnv(gym.Env):
             speed_excess = max(0.0, car_vel - curve_target_speed)
             curve_speed_penalty = -0.3 * speed_excess
 
-        # 2b. STEERING ALIGNMENT REWARD - encourage steering in curve direction
-        # Wall safety penalty (only if within 3 m of wall)
+        # 2b. LATERAL BALANCE REWARD - always positive, highest when centred
+        balance_reward = 0.4 * (1.0 - min(1.0, abs(curve_ind)))  # curve_ind in [-1,1]
+
+        # 2c. Wall safety penalty (only if within 3 m of wall)
         safety_penalty = 0.0
         safety_threshold = 3.0
         if min_lidar < safety_threshold:
             safety_penalty = -2.0 * (safety_threshold - min_lidar)
 
-        # Combine and clip final reward
-        reward = progress_reward + speed_reward + curve_speed_penalty + safety_penalty
+        # Combine and clip final reward (keep total in [-1,1])
+        reward = progress_reward + speed_reward + curve_speed_penalty + balance_reward + safety_penalty
         reward = float(np.clip(reward, -1.0, 1.0))
         # Store breakdown for debugging
         self._last_reward_breakdown = {
             'progress': float(progress_reward),
             'speed': float(speed_reward),
             'curve_penalty': float(curve_speed_penalty),
+            'balance': float(balance_reward),
             'safety': float(safety_penalty)
         }
         
