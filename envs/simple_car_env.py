@@ -358,6 +358,7 @@ class SimpleCarEnv(gym.Env):
         car_angle = self.data.qpos[2]
         car_vel = np.linalg.norm(self.data.qvel[0:2])
         drive = action[0]  # Throttle value for brake reward
+        steer = action[1]  # Steering value for steer-away bonus
         
         # Off-track termination
         if not self._is_on_track(pos_xy[0], pos_xy[1]):
